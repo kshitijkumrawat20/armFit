@@ -624,19 +624,34 @@ pub fn community_results_for_specs(specs: &SystemSpecs) -> Vec<CommunityResult> 
 
     let mut out = Vec::new();
     for s in subs {
-        for r in s["results"]
-            .as_array()
-            .map(|v| v.as_slice())
-            .unwrap_or_default()
-        {
-            let Some(tps) = r["avgTps"].as_f64().filter(|t| *t > 0.0) else {
+        let results: Vec<&serde_json::Value> = if let Some(results) = s["results"].as_array() {
+            results.iter().collect()
+        } else if s["model"].is_string() || s["provider"].is_string() || s["avgTps"].is_f64() {
+            vec![s]
+        } else {
+            Vec::new()
+        };
+        for r in results {
+            let model = r["model"]
+                .as_str()
+                .or_else(|| r["result"]["model"].as_str());
+            let provider = r["provider"]
+                .as_str()
+                .or_else(|| r["result"]["provider"].as_str());
+            let Some(tps) = r["avgTps"]
+                .as_f64()
+                .or_else(|| r["result"]["avgTps"].as_f64())
+                .filter(|t| *t > 0.0)
+            else {
                 continue;
             };
             out.push(CommunityResult {
-                model: r["model"].as_str().unwrap_or("?").to_string(),
-                provider: r["provider"].as_str().unwrap_or("").to_string(),
+                model: model.unwrap_or("?").to_string(),
+                provider: provider.unwrap_or("").to_string(),
                 avg_tps: tps,
-                ttft_ms: r["avgTtftMs"].as_f64(),
+                ttft_ms: r["avgTtftMs"]
+                    .as_f64()
+                    .or_else(|| r["result"]["avgTtftMs"].as_f64()),
                 match_level: evaluate_hardware_match(&s["hardware"], specs),
             });
         }

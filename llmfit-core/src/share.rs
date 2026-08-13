@@ -309,6 +309,22 @@ fn short_hash(s: &str) -> String {
 // Local benchmark store
 // ---------------------------------------------------------------------------
 
+fn result_entries_for_payload<'a>(payload: &'a Value) -> Vec<&'a Value> {
+    if let Some(results) = payload.get("results").and_then(Value::as_array) {
+        return results.iter().collect();
+    }
+
+    let legacy_present = payload.get("model").is_some()
+        || payload.get("provider").is_some()
+        || payload.get("avgTps").is_some()
+        || payload.get("avgTtftMs").is_some()
+        || payload.get("result").is_some();
+    if legacy_present {
+        return vec![payload];
+    }
+    Vec::new()
+}
+
 /// A submission payload recorded in the local benchmark store.
 #[derive(Clone)]
 pub struct StoredBenchmark {
@@ -326,17 +342,20 @@ impl StoredBenchmark {
 
     /// One line per benchmark result: `model via provider — N tok/s`.
     pub fn result_lines(&self) -> Vec<String> {
-        let Some(results) = self.payload["results"].as_array() else {
-            return Vec::new();
-        };
-        results
-            .iter()
+        result_entries_for_payload(&self.payload)
+            .into_iter()
             .map(|r| {
                 format!(
                     "{} via {} — {:.1} tok/s",
-                    r["model"].as_str().unwrap_or("?"),
-                    r["provider"].as_str().unwrap_or("?"),
-                    r["avgTps"].as_f64().unwrap_or(0.0),
+                    r["model"]
+                        .as_str()
+                        .unwrap_or_else(|| r["result"]["model"].as_str().unwrap_or("?")),
+                    r["provider"]
+                        .as_str()
+                        .unwrap_or_else(|| r["result"]["provider"].as_str().unwrap_or("?")),
+                    r["avgTps"]
+                        .as_f64()
+                        .unwrap_or_else(|| r["result"]["avgTps"].as_f64().unwrap_or(0.0)),
                 )
             })
             .collect()
@@ -488,11 +507,14 @@ impl LocalBenchIndex {
             if match_level == crate::benchmarks::HardwareMatchLevel::NoMatch {
                 continue;
             }
-            let Some(results) = s.payload["results"].as_array() else {
-                continue;
-            };
-            for r in results {
-                if let (Some(model), Some(tps)) = (r["model"].as_str(), r["avgTps"].as_f64())
+            for r in result_entries_for_payload(&s.payload) {
+                let model = r["model"]
+                    .as_str()
+                    .or_else(|| r["result"]["model"].as_str());
+                let tps = r["avgTps"]
+                    .as_f64()
+                    .or_else(|| r["result"]["avgTps"].as_f64());
+                if let (Some(model), Some(tps)) = (model, tps)
                     && tps > 0.0
                 {
                     entries.push((model.to_string(), tps, match_level));
@@ -1475,6 +1497,64 @@ mod tests {
 
         unsafe { std::env::remove_var("LLMFIT_BENCH_STORE") };
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn schema_v2_results_array_is_consumed_for_local_bench_index() {
+        let _specs = specs_with_gpu("NVIDIA GeForce RTX 4090");
+        let payload = serde_json::json!({
+            "schemaVersion": 2,
+            "hardware": {
+                "hwClass": "DISCRETE_GPU",
+                "hardwareName": "NVIDIA GeForce RTX 4090",
+                "cpu": "Intel(R) Core(TM) i9-14900K",
+                "cpuArchitecture": "x86_64",
+                "ramGb": 64.0,
+                "os": "linux"
+            },
+            "results": [
+                { "model": "llama3.1:8b", "provider": "ollama", "avgTps": 128.44 },
+                { "model": "qwen2.5:7b", "provider": "ollama", "avgTps": 89.25 }
+            ]
+        });
+        let mut entries = Vec::new();
+        for r in result_entries_for_payload(&payload) {
+            let model = r["model"].as_str().unwrap();
+            let tps = r["avgTps"].as_f64().unwrap();
+            entries.push((
+                model.to_string(),
+                tps,
+                crate::benchmarks::HardwareMatchLevel::Exact,
+            ));
+        }
+        let idx = LocalBenchIndex { entries };
+        assert!(idx.lookup("test/llama-3.1-8b").is_some());
+        assert!(idx.lookup("test/qwen2.5-7b").is_some());
+    }
+
+    #[test]
+    fn schema_v1_legacy_top_level_result_still_loads() {
+        use crate::benchmarks::evaluate_hardware_match;
+        let specs = specs_with_gpu("NVIDIA GeForce RTX 4090");
+        let payload = serde_json::json!({
+            "schemaVersion": 1,
+            "hardware": {
+                "hwClass": "DISCRETE_GPU",
+                "hardwareName": "NVIDIA GeForce RTX 4090",
+                "cpu": "Intel(R) Core(TM) i9-14900K",
+                "cpuArchitecture": "x86_64",
+                "ramGb": 64.0,
+                "os": "linux"
+            },
+            "model": "llama3.1:8b",
+            "provider": "ollama",
+            "avgTps": 42.0
+        });
+        assert_eq!(result_entries_for_payload(&payload).len(), 1);
+        assert!(
+            evaluate_hardware_match(&payload["hardware"], &specs)
+                != crate::benchmarks::HardwareMatchLevel::NoMatch
+        );
     }
 
     #[test]
