@@ -1206,7 +1206,9 @@ fn find_name_index_by_selector<T>(
         .enumerate()
         .filter_map(|(i, item)| {
             let name = get_name(item);
-            if name.to_lowercase().contains(&lower) || llmfit_core::providers::tag_matches_model(needle, name) {
+            if name.to_lowercase().contains(&lower)
+                || llmfit_core::providers::tag_matches_model(needle, name)
+            {
                 Some((i, name.to_string()))
             } else {
                 None

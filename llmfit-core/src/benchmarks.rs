@@ -577,24 +577,24 @@ pub fn evaluate_hardware_match(hw: &serde_json::Value, specs: &SystemSpecs) -> H
         return HardwareMatchLevel::NoMatch;
     }
 
-    let arch_str = hw["cpuArchitecture"].as_str();
-    let specs_arch = match specs.architecture {
-        crate::hardware::CpuArchitecture::Aarch64 => "aarch64",
-        crate::hardware::CpuArchitecture::X86_64 => "x86_64",
-        crate::hardware::CpuArchitecture::Unknown => "",
-    };
+    let hw_arch = hw["cpuArchitecture"]
+        .as_str()
+        .map(crate::hardware::CpuArchitecture::from_arch_str);
 
-    if let Some(a) = arch_str {
-        if a.eq_ignore_ascii_case(specs_arch) {
-            HardwareMatchLevel::Exact
-        } else {
-            HardwareMatchLevel::NoMatch
+    match hw_arch {
+        Some(hw_arch) => {
+            if hw_arch == specs.architecture {
+                HardwareMatchLevel::Exact
+            } else {
+                HardwareMatchLevel::NoMatch
+            }
         }
-    } else {
-        if specs.architecture == crate::hardware::CpuArchitecture::Aarch64 {
-            HardwareMatchLevel::Partial
-        } else {
-            HardwareMatchLevel::HighConfidence
+        None => {
+            if specs.architecture == crate::hardware::CpuArchitecture::Aarch64 {
+                HardwareMatchLevel::Partial
+            } else {
+                HardwareMatchLevel::HighConfidence
+            }
         }
     }
 }
@@ -1115,6 +1115,22 @@ mod tests {
             &cpu_only,
             &specs("Test CPU", Some("Test GPU"))
         ));
+    }
+
+    #[test]
+    fn hardware_payload_matching_accepts_arm64_arch_aliases() {
+        use serde_json::json;
+        let mut specs = specs("Neoverse-N1", None);
+        specs.architecture = crate::hardware::CpuArchitecture::Aarch64;
+        let hw = json!({
+            "cpu": "Neoverse-N1",
+            "hardwareName": null,
+            "cpuArchitecture": "arm64"
+        });
+        assert_eq!(
+            evaluate_hardware_match(&hw, &specs),
+            HardwareMatchLevel::Exact
+        );
     }
 
     #[test]
