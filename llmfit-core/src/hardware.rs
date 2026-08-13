@@ -29,6 +29,80 @@ impl GpuBackend {
     }
 }
 
+/// CPU instruction-set architecture relevant to local inference.
+///
+/// This intentionally has a small, stable vocabulary. Platforms outside the
+/// currently supported architectures are represented as `Unknown` rather than
+/// being guessed from a CPU model string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CpuArchitecture {
+    Aarch64,
+    X86_64,
+    #[default]
+    Unknown,
+}
+
+impl CpuArchitecture {
+    /// Classify a Rust target architecture string. Kept separate from runtime
+    /// detection so fixtures can exercise architecture handling on any host.
+    pub fn from_arch_str(arch: &str) -> Self {
+        match arch.trim().to_ascii_lowercase().as_str() {
+            "aarch64" | "arm64" => Self::Aarch64,
+            "x86_64" | "amd64" => Self::X86_64,
+            _ => Self::Unknown,
+        }
+    }
+
+    pub fn detect() -> Self {
+        Self::from_arch_str(std::env::consts::ARCH)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Aarch64 => "aarch64",
+            Self::X86_64 => "x86_64",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Result of looking for an Arm ISA capability.
+///
+/// `NotDetected` is used only when the operating system supplied a usable
+/// feature list and that capability was absent. `Unknown` means llmfit could
+/// not obtain reliable feature metadata; it must not be interpreted as an
+/// unsupported capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ArmCapabilityStatus {
+    Detected,
+    NotDetected,
+    #[default]
+    Unknown,
+}
+
+/// Arm CPU capabilities reported by the operating system.
+///
+/// This is present only for an ARM64 host. Its individual values remain
+/// `Unknown` if the platform cannot expose reliable feature information.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ArmCapabilities {
+    pub neon: ArmCapabilityStatus,
+    pub sve: ArmCapabilityStatus,
+    pub sve2: ArmCapabilityStatus,
+}
+
+impl ArmCapabilities {
+    pub fn unknown() -> Self {
+        Self {
+            neon: ArmCapabilityStatus::Unknown,
+            sve: ArmCapabilityStatus::Unknown,
+            sve2: ArmCapabilityStatus::Unknown,
+        }
+    }
+}
+
 /// Information about a single detected GPU.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct GpuInfo {
@@ -41,10 +115,23 @@ pub struct GpuInfo {
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SystemSpecs {
+    /// Detected CPU instruction-set architecture. This is never inferred from
+    /// the CPU model string.
+    pub architecture: CpuArchitecture,
     pub total_ram_gb: f64,
     pub available_ram_gb: f64,
+    /// Physical CPU core count when the platform exposes it. `None` is an
+    /// unavailable measurement, not an assertion that SMT is absent.
+    pub physical_cpu_cores: Option<usize>,
+    /// Logical processors visible to this process. Kept as the existing field
+    /// name to preserve all current scoring and CLI behavior.
     pub total_cpu_cores: usize,
     pub cpu_name: String,
+    /// CPU vendor when the OS provides a reliable identifier. `None` means the
+    /// platform did not expose one; it does not imply an unknown CPU model.
+    pub cpu_vendor: Option<String>,
+    /// ARM64 ISA capabilities, or `None` for non-ARM systems.
+    pub arm_capabilities: Option<ArmCapabilities>,
     pub has_gpu: bool,
     pub gpu_vram_gb: Option<f64>,
     /// Total VRAM across all same-model GPUs (e.g., 48GB for 2x RTX 3090).
@@ -85,8 +172,12 @@ impl SystemSpecs {
             available_ram_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
         };
 
+        let architecture = CpuArchitecture::detect();
         let total_cpu_cores = sys.cpus().len();
+        let physical_cpu_cores = System::physical_core_count();
         let cpu_name = Self::detect_cpu_name(&sys);
+        let cpu_vendor = Self::detect_cpu_vendor();
+        let arm_capabilities = Self::detect_arm_capabilities(architecture);
 
         // On Windows, a BIOS GPU UMA carveout hides the carved-out portion from
         // the OS view of RAM (issue #810): a 32 GB Hawk Point machine with an
@@ -119,12 +210,13 @@ impl SystemSpecs {
         };
         let gpu_count: u32 = gpus.iter().map(|g| g.count).sum();
 
-        let cpu_backend =
-            if cfg!(target_arch = "aarch64") || cpu_name.to_lowercase().contains("apple") {
-                GpuBackend::CpuArm
-            } else {
-                GpuBackend::CpuX86
-            };
+        let cpu_backend = if architecture == CpuArchitecture::Aarch64
+            || cpu_name.to_lowercase().contains("apple")
+        {
+            GpuBackend::CpuArm
+        } else {
+            GpuBackend::CpuX86
+        };
         let backend = primary.map(|g| g.backend).unwrap_or(cpu_backend);
 
         // Only Apple Silicon reports unified memory *and* runs Metal, so the
@@ -138,10 +230,14 @@ impl SystemSpecs {
         };
 
         SystemSpecs {
+            architecture,
             total_ram_gb,
             available_ram_gb,
+            physical_cpu_cores,
             total_cpu_cores,
             cpu_name,
+            cpu_vendor,
+            arm_capabilities,
             has_gpu,
             gpu_vram_gb,
             total_gpu_vram_gb,
@@ -2114,6 +2210,137 @@ impl SystemSpecs {
         "Unknown CPU".to_string()
     }
 
+    /// Detect a CPU vendor from Linux kernel metadata when it is explicitly
+    /// provided. Windows continues to rely on `sysinfo` for its existing CPU
+    /// name behavior and reports no vendor rather than running extra commands.
+    fn detect_cpu_vendor() -> Option<String> {
+        #[cfg(target_os = "linux")]
+        {
+            let text = std::fs::read_to_string("/proc/cpuinfo").ok()?;
+            Self::parse_cpu_vendor_from_cpuinfo(&text)
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+    }
+
+    /// Parse CPU vendor metadata from Linux `/proc/cpuinfo`.
+    ///
+    /// x86 uses `vendor_id`; Linux ARM systems use a numeric `CPU implementer`
+    /// field. Only well-known implementer IDs are named. Unknown IDs remain
+    /// absent rather than being presented as a guessed vendor.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fn parse_cpu_vendor_from_cpuinfo(text: &str) -> Option<String> {
+        for line in text.lines() {
+            let Some((lhs, rhs)) = line.split_once(':') else {
+                continue;
+            };
+            if lhs.trim().eq_ignore_ascii_case("vendor_id") {
+                let vendor = rhs.trim();
+                if !vendor.is_empty() && !vendor.eq_ignore_ascii_case("unknown") {
+                    return Some(vendor.to_string());
+                }
+            }
+        }
+
+        let implementer = text.lines().find_map(|line| {
+            let (lhs, rhs) = line.split_once(':')?;
+            lhs.trim()
+                .eq_ignore_ascii_case("cpu implementer")
+                .then_some(rhs.trim())
+        })?;
+
+        let implementer = implementer
+            .strip_prefix("0x")
+            .or_else(|| implementer.strip_prefix("0X"))
+            .unwrap_or(implementer);
+        let id = u32::from_str_radix(implementer, 16).ok()?;
+        let vendor = match id {
+            0x41 => "ARM",
+            0x42 => "Broadcom",
+            0x43 => "Cavium",
+            0x46 => "Fujitsu",
+            0x48 => "HiSilicon",
+            0x4e => "NVIDIA",
+            0x50 => "AppliedMicro",
+            0x51 => "Qualcomm",
+            0x53 => "Samsung",
+            0x56 => "Marvell",
+            0x61 => "Apple",
+            0xc0 => "Ampere",
+            _ => return None,
+        };
+        Some(vendor.to_string())
+    }
+
+    /// Detect Linux ARM64 capabilities. A failure to read `/proc/cpuinfo`
+    /// deliberately returns explicit unknown values: feature absence and
+    /// unavailable metadata are distinct states.
+    fn detect_arm_capabilities(architecture: CpuArchitecture) -> Option<ArmCapabilities> {
+        if architecture != CpuArchitecture::Aarch64 {
+            return None;
+        }
+
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        {
+            return std::fs::read_to_string("/proc/cpuinfo")
+                .ok()
+                .map(|text| Self::parse_arm_capabilities_from_cpuinfo(&text))
+                .or_else(|| Some(ArmCapabilities::unknown()));
+        }
+
+        #[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
+        {
+            // We know the architecture, but this build target has no Linux
+            // procfs capability source. Do not manufacture defaults.
+            Some(ArmCapabilities::unknown())
+        }
+    }
+
+    /// Parse the kernel-provided ARM feature list in `/proc/cpuinfo`.
+    /// `asimd` is the Linux ARM64 spelling of NEON. The parser is intentionally
+    /// fixture-friendly and works independently of the compiling host.
+    #[cfg_attr(
+        not(all(target_os = "linux", target_arch = "aarch64")),
+        allow(dead_code)
+    )]
+    fn parse_arm_capabilities_from_cpuinfo(text: &str) -> ArmCapabilities {
+        let feature_lines: Vec<&str> = text
+            .lines()
+            .filter_map(|line| {
+                let (lhs, rhs) = line.split_once(':')?;
+                (lhs.trim().eq_ignore_ascii_case("features")).then_some(rhs.trim())
+            })
+            .filter(|features| !features.is_empty())
+            .collect();
+
+        if feature_lines.is_empty() {
+            return ArmCapabilities::unknown();
+        }
+
+        let has_feature = |name: &str| {
+            feature_lines.iter().any(|line| {
+                line.split_ascii_whitespace()
+                    .any(|feature| feature.eq_ignore_ascii_case(name))
+            })
+        };
+        let status = |present| {
+            if present {
+                ArmCapabilityStatus::Detected
+            } else {
+                ArmCapabilityStatus::NotDetected
+            }
+        };
+
+        ArmCapabilities {
+            neon: status(has_feature("asimd") || has_feature("neon")),
+            sve: status(has_feature("sve")),
+            sve2: status(has_feature("sve2")),
+        }
+    }
+
     fn read_cpu_name_from_proc_cpuinfo() -> Option<String> {
         #[cfg(target_os = "linux")]
         {
@@ -2127,6 +2354,7 @@ impl SystemSpecs {
         }
     }
 
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn parse_cpu_name_from_cpuinfo(text: &str) -> Option<String> {
         for key in ["model name", "hardware", "processor", "cpu model", "model"] {
             for line in text.lines() {
@@ -3358,7 +3586,97 @@ fn estimate_vram_from_name(name: &str) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::SystemSpecs;
+    use super::{ArmCapabilityStatus, CpuArchitecture, SystemSpecs};
+
+    #[test]
+    fn cpu_architecture_recognizes_x86_64_aliases() {
+        assert_eq!(
+            CpuArchitecture::from_arch_str("x86_64"),
+            CpuArchitecture::X86_64
+        );
+        assert_eq!(
+            CpuArchitecture::from_arch_str("amd64"),
+            CpuArchitecture::X86_64
+        );
+    }
+
+    #[test]
+    fn cpu_architecture_recognizes_aarch64_aliases() {
+        assert_eq!(
+            CpuArchitecture::from_arch_str("aarch64"),
+            CpuArchitecture::Aarch64
+        );
+        assert_eq!(
+            CpuArchitecture::from_arch_str("ARM64"),
+            CpuArchitecture::Aarch64
+        );
+    }
+
+    #[test]
+    fn cpu_architecture_handles_unknown_values_safely() {
+        assert_eq!(
+            CpuArchitecture::from_arch_str("riscv64gc"),
+            CpuArchitecture::Unknown
+        );
+        assert_eq!(CpuArchitecture::from_arch_str(""), CpuArchitecture::Unknown);
+    }
+
+    #[test]
+    fn arm_cpuinfo_fixture_parses_model_vendor_and_capabilities() {
+        let cpuinfo = r#"
+processor       : 0
+CPU implementer : 0xc0
+CPU architecture: 8
+CPU part        : 0xac3
+Features        : fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics sve sve2
+Hardware        : AmpereOne Mount Jade
+"#;
+
+        assert_eq!(
+            SystemSpecs::parse_cpu_name_from_cpuinfo(cpuinfo).as_deref(),
+            Some("AmpereOne Mount Jade")
+        );
+        assert_eq!(
+            SystemSpecs::parse_cpu_vendor_from_cpuinfo(cpuinfo).as_deref(),
+            Some("Ampere")
+        );
+
+        let capabilities = SystemSpecs::parse_arm_capabilities_from_cpuinfo(cpuinfo);
+        assert_eq!(capabilities.neon, ArmCapabilityStatus::Detected);
+        assert_eq!(capabilities.sve, ArmCapabilityStatus::Detected);
+        assert_eq!(capabilities.sve2, ArmCapabilityStatus::Detected);
+    }
+
+    #[test]
+    fn arm_capabilities_distinguish_absent_features_from_unknown_metadata() {
+        let feature_list = "Features : fp asimd aes sha2\n";
+        let capabilities = SystemSpecs::parse_arm_capabilities_from_cpuinfo(feature_list);
+        assert_eq!(capabilities.neon, ArmCapabilityStatus::Detected);
+        assert_eq!(capabilities.sve, ArmCapabilityStatus::NotDetected);
+        assert_eq!(capabilities.sve2, ArmCapabilityStatus::NotDetected);
+
+        let unavailable = SystemSpecs::parse_arm_capabilities_from_cpuinfo("Hardware : fixture\n");
+        assert_eq!(unavailable.neon, ArmCapabilityStatus::Unknown);
+        assert_eq!(unavailable.sve, ArmCapabilityStatus::Unknown);
+        assert_eq!(unavailable.sve2, ArmCapabilityStatus::Unknown);
+    }
+
+    #[test]
+    fn non_arm_architecture_has_no_arm_capability_record() {
+        assert_eq!(
+            SystemSpecs::detect_arm_capabilities(CpuArchitecture::X86_64),
+            None
+        );
+    }
+
+    #[test]
+    fn physical_core_count_is_never_larger_than_logical_count_when_available() {
+        let mut sys = sysinfo::System::new_all();
+        sys.refresh_cpu_all();
+        if let Some(physical) = sysinfo::System::physical_core_count() {
+            assert!(physical <= sys.cpus().len());
+        }
+    }
 
     // Regression for #303 (wezm): Granite Ridge iGPU ("Radeon Graphics",
     // 2 GB UMA carve-out) enumerated alongside an RX 9060 XT. The iGPU must
@@ -3807,10 +4125,14 @@ GPU id = 1 (NVIDIA GeForce RTX 4090)
 
     fn make_specs_no_gpu() -> SystemSpecs {
         SystemSpecs {
+            architecture: super::CpuArchitecture::X86_64,
             total_ram_gb: 32.0,
             available_ram_gb: 24.0,
+            physical_cpu_cores: Some(8),
             total_cpu_cores: 8,
             cpu_name: "Test CPU".to_string(),
+            cpu_vendor: None,
+            arm_capabilities: None,
             has_gpu: false,
             gpu_vram_gb: None,
             total_gpu_vram_gb: None,
@@ -3827,10 +4149,14 @@ GPU id = 1 (NVIDIA GeForce RTX 4090)
 
     fn make_specs_with_gpu() -> SystemSpecs {
         SystemSpecs {
+            architecture: super::CpuArchitecture::X86_64,
             total_ram_gb: 32.0,
             available_ram_gb: 24.0,
+            physical_cpu_cores: Some(8),
             total_cpu_cores: 8,
             cpu_name: "Test CPU".to_string(),
+            cpu_vendor: None,
+            arm_capabilities: None,
             has_gpu: true,
             gpu_vram_gb: Some(8.0),
             total_gpu_vram_gb: Some(8.0),
@@ -4397,10 +4723,14 @@ GPU id = 1 (NVIDIA GeForce RTX 4090)
     #[test]
     fn test_ram_override_updates_ram_values() {
         let specs = SystemSpecs {
+            architecture: super::CpuArchitecture::X86_64,
             total_ram_gb: 32.0,
             available_ram_gb: 24.0,
+            physical_cpu_cores: Some(8),
             total_cpu_cores: 8,
             cpu_name: "Test CPU".to_string(),
+            cpu_vendor: None,
+            arm_capabilities: None,
             has_gpu: true,
             gpu_vram_gb: Some(16.0),
             total_gpu_vram_gb: Some(16.0),
@@ -4431,10 +4761,14 @@ GPU id = 1 (NVIDIA GeForce RTX 4090)
     #[test]
     fn test_ram_override_unified_memory_updates_gpu() {
         let specs = SystemSpecs {
+            architecture: super::CpuArchitecture::Aarch64,
             total_ram_gb: 36.0,
             available_ram_gb: 30.0,
+            physical_cpu_cores: Some(10),
             total_cpu_cores: 10,
             cpu_name: "Apple M2 Max".to_string(),
+            cpu_vendor: Some("Apple".to_string()),
+            arm_capabilities: Some(super::ArmCapabilities::unknown()),
             has_gpu: true,
             gpu_vram_gb: Some(36.0),
             total_gpu_vram_gb: Some(36.0),
@@ -4465,10 +4799,14 @@ GPU id = 1 (NVIDIA GeForce RTX 4090)
     #[test]
     fn test_cpu_core_override() {
         let specs = SystemSpecs {
+            architecture: super::CpuArchitecture::X86_64,
             total_ram_gb: 32.0,
             available_ram_gb: 24.0,
+            physical_cpu_cores: Some(8),
             total_cpu_cores: 8,
             cpu_name: "Test CPU".to_string(),
+            cpu_vendor: None,
+            arm_capabilities: None,
             has_gpu: false,
             gpu_vram_gb: None,
             total_gpu_vram_gb: None,

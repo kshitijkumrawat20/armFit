@@ -955,10 +955,14 @@ mod tests {
 
     fn test_specs() -> SystemSpecs {
         SystemSpecs {
+            architecture: crate::hardware::CpuArchitecture::X86_64,
             total_ram_gb: 32.0,
             available_ram_gb: 24.0,
+            physical_cpu_cores: Some(8),
             total_cpu_cores: 8,
             cpu_name: "Test CPU".to_string(),
+            cpu_vendor: None,
+            arm_capabilities: None,
             has_gpu: true,
             gpu_vram_gb: Some(12.0),
             total_gpu_vram_gb: Some(12.0),

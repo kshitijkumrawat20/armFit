@@ -42,6 +42,7 @@ pub struct BenchSummary {
     pub max_tps: f64,
     pub avg_total_ms: f64,
     pub avg_output_tokens: f64,
+    pub avg_prompt_tokens: f64,
 }
 
 impl BenchSummary {
@@ -56,6 +57,7 @@ impl BenchSummary {
                 max_tps: 0.0,
                 avg_total_ms: 0.0,
                 avg_output_tokens: 0.0,
+                avg_prompt_tokens: 0.0,
             };
         }
         // Only compute avg TTFT if any run has a measured value
@@ -73,6 +75,7 @@ impl BenchSummary {
             max_tps: runs.iter().map(|r| r.tps).fold(0.0_f64, f64::max),
             avg_total_ms: runs.iter().map(|r| r.total_ms).sum::<f64>() / n,
             avg_output_tokens: runs.iter().map(|r| r.output_tokens as f64).sum::<f64>() / n,
+            avg_prompt_tokens: runs.iter().map(|r| r.prompt_tokens as f64).sum::<f64>() / n,
         }
     }
 }

@@ -1,4 +1,4 @@
-use crate::hardware::{GpuBackend, SystemSpecs};
+use crate::hardware::{CpuArchitecture, GpuBackend, SystemSpecs};
 use crate::models::{self, KvQuant, LlmModel, UseCase};
 
 /// Default context window cap used for memory estimation when no explicit
@@ -232,6 +232,92 @@ pub struct EstimateBasis {
     pub local_calibration: Option<f64>,
 }
 
+/// ARM64-specific architecture assessment. This deliberately remains separate
+/// from [`FitLevel`] and the composite fit score: the catalog currently has no
+/// per-model ARM execution metadata, so an ARM64 machine alone is not enough
+/// evidence to promote a model's compatibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArmArchitectureCompatibility {
+    Compatible,
+    Incompatible,
+    Unknown,
+}
+
+/// Whether the existing runtime-selection logic provides ARM-specific support
+/// evidence. This remains additive to the existing fit model: a runtime may be
+/// selected on paper (`Supported`/`Detected`) without being installed or
+/// benchmarked on the host. Real evidence is tracked with the installed and
+/// benchmarked states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArmRuntimeStatus {
+    Supported,
+    Detected,
+    Installed,
+    Benchmarkable,
+    Benchmarked,
+    Unavailable,
+    Unknown,
+}
+
+/// Memory assessment shown by the ARM annotation. It mirrors the existing
+/// fit result but does not participate in score calculation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArmMemoryStatus {
+    Fits,
+    Insufficient,
+}
+
+/// Whether performance comes from an existing measurement or the current
+/// estimator. No ARM-specific numbers are invented by this layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArmPerformanceProvenance {
+    Measured,
+    Estimated,
+    Unavailable,
+}
+
+/// Existing benchmark evidence relevant to the ARM annotation. Current
+/// benchmark records match CPU/GPU identity but do not record architecture,
+/// so a matching measurement is explicitly not claimed as independently
+/// verified ARM-specific evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArmBenchmarkEvidence {
+    MatchingHardwareMeasurement,
+    Unavailable,
+}
+
+/// A mathematical comparison between real measurements and theoretical estimates.
+/// Kept strictly separated from ARM-specific logic; applies to all architectures.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PerformanceComparison {
+    /// Measured generation throughput (tok/s) from ground truth.
+    pub measured_tps: f64,
+    /// Uncalibrated theoretical formula estimate (tok/s).
+    pub estimated_tps: f64,
+    /// Absolute difference: measured - estimated. Positive means measured is faster.
+    pub difference_tps: f64,
+    /// Ratio of measured / estimated. 1.0 means perfect agreement.
+    pub ratio: f64,
+}
+
+/// An explainable ARM recommendation that accompanies a [`ModelFit`] without
+/// changing its score, fit level, ranking, or throughput estimate.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ArmRecommendation {
+    pub architecture: CpuArchitecture,
+    pub architecture_compatibility: ArmArchitectureCompatibility,
+    pub memory_status: ArmMemoryStatus,
+    pub runtime_status: ArmRuntimeStatus,
+    pub performance_provenance: ArmPerformanceProvenance,
+    pub benchmark_evidence: ArmBenchmarkEvidence,
+    pub notes: Vec<String>,
+}
+
 #[derive(Clone, serde::Serialize)]
 pub struct ModelFit {
     pub model: LlmModel,
@@ -267,6 +353,30 @@ pub struct ModelFit {
 }
 
 impl ModelFit {
+    /// Compares the formula-based estimate to ground truth measurements, if available.
+    /// Exposes the baseline estimator accuracy before local calibration is applied.
+    pub fn performance_comparison(&self) -> Option<PerformanceComparison> {
+        let measured = self.measured_tps.as_ref()?;
+        if self.estimated_tps <= 0.0 {
+            return None;
+        }
+
+        // Back out the local calibration if it was applied, to compare against
+        // the original theoretical formula.
+        let raw_est = if let Some(cal) = self.estimate_basis.local_calibration {
+            self.estimated_tps / cal
+        } else {
+            self.estimated_tps
+        };
+
+        Some(PerformanceComparison {
+            measured_tps: measured.tok_s,
+            estimated_tps: raw_est,
+            difference_tps: measured.tok_s - raw_est,
+            ratio: measured.tok_s / raw_est,
+        })
+    }
+
     pub fn analyze(model: &LlmModel, system: &SystemSpecs) -> Self {
         Self::analyze_with_context_limit(model, system, None)
     }
@@ -734,6 +844,146 @@ impl ModelFit {
             RunMode::CpuOffload => "CPU+GPU",
             RunMode::CpuOnly => "CPU",
         }
+    }
+
+    /// Build the optional ARM recommendation annotation for this fit.
+    ///
+    /// It is calculated on demand rather than cached in `ModelFit`, because
+    /// benchmark indexes attach `measured_tps` after base analysis. On-demand
+    /// evaluation keeps the annotation accurate without changing any existing
+    /// scoring or result-construction paths. x86_64 intentionally receives no
+    /// ARM annotation so existing llmfit behavior remains unchanged.
+    pub fn arm_recommendation(&self, system: &SystemSpecs) -> Option<ArmRecommendation> {
+        let architecture = system.architecture;
+        if architecture == CpuArchitecture::X86_64 {
+            return None;
+        }
+
+        let memory_status = if self.fit_level == FitLevel::TooTight {
+            ArmMemoryStatus::Insufficient
+        } else {
+            ArmMemoryStatus::Fits
+        };
+        let performance_provenance = if self.measured_tps.is_some() {
+            ArmPerformanceProvenance::Measured
+        } else if self.estimated_tps > 0.0 {
+            ArmPerformanceProvenance::Estimated
+        } else {
+            ArmPerformanceProvenance::Unavailable
+        };
+        let benchmark_evidence = if self.measured_tps.is_some() {
+            ArmBenchmarkEvidence::MatchingHardwareMeasurement
+        } else {
+            ArmBenchmarkEvidence::Unavailable
+        };
+
+        let (architecture_compatibility, runtime_status, mut notes) = match architecture {
+            CpuArchitecture::Aarch64 => {
+                let runtime_status = if self.runtime == InferenceRuntime::Unsupported {
+                    ArmRuntimeStatus::Unavailable
+                } else if self.measured_tps.is_some() {
+                    ArmRuntimeStatus::Benchmarked
+                } else if self.installed {
+                    ArmRuntimeStatus::Installed
+                } else if self.runtime == InferenceRuntime::Mlx
+                    && system.backend == GpuBackend::Metal
+                    && system.unified_memory
+                {
+                    // This is the existing Apple Silicon runtime-selection
+                    // rule, not a new provider or runtime claim.
+                    ArmRuntimeStatus::Supported
+                } else if self.estimated_tps > 0.0 {
+                    ArmRuntimeStatus::Detected
+                } else {
+                    ArmRuntimeStatus::Unknown
+                };
+                let architecture_compatibility = match runtime_status {
+                    ArmRuntimeStatus::Supported
+                    | ArmRuntimeStatus::Installed
+                    | ArmRuntimeStatus::Benchmarked
+                        if backend_compatible(&self.model, system) =>
+                    {
+                        ArmArchitectureCompatibility::Compatible
+                    }
+                    ArmRuntimeStatus::Unavailable => ArmArchitectureCompatibility::Incompatible,
+                    _ => ArmArchitectureCompatibility::Unknown,
+                };
+                let mut notes = vec!["System architecture: aarch64".to_string()];
+                match memory_status {
+                    ArmMemoryStatus::Fits => notes.push(format!(
+                        "Existing fit analysis: model fits its selected {:.1} GB memory pool",
+                        self.memory_available_gb
+                    )),
+                    ArmMemoryStatus::Insufficient => notes.push(format!(
+                        "Existing fit analysis: model needs {:.1} GB but {:.1} GB is available",
+                        self.memory_required_gb, self.memory_available_gb
+                    )),
+                }
+                match runtime_status {
+                    ArmRuntimeStatus::Supported => notes.push(format!(
+                        "Existing platform logic selected {} for this Apple Silicon configuration",
+                        self.runtime.label()
+                    )),
+                    ArmRuntimeStatus::Detected => notes.push(format!(
+                        "{} is modelled as a valid ARM64 runtime path, but runtime availability is not independently confirmed",
+                        self.runtime.label()
+                    )),
+                    ArmRuntimeStatus::Installed => notes.push(format!(
+                        "{} is installed and available locally on this ARM64 machine",
+                        self.runtime.label()
+                    )),
+                    ArmRuntimeStatus::Benchmarkable => notes.push(format!(
+                        "{} is installable/benchmarkable on this ARM64 machine",
+                        self.runtime.label()
+                    )),
+                    ArmRuntimeStatus::Benchmarked => notes.push(format!(
+                        "Measured ARM64 throughput already exists for this configuration; benchmark evidence is preferred over the estimator for {}",
+                        self.runtime.label()
+                    )),
+                    ArmRuntimeStatus::Unavailable => notes.push(
+                        "The existing fitter marks the required runtime as unsupported".to_string(),
+                    ),
+                    ArmRuntimeStatus::Unknown => notes.push(format!(
+                        "{} was selected by the existing fitter, but ARM64 runtime availability is not independently detected",
+                        self.runtime.label()
+                    )),
+                }
+                (architecture_compatibility, runtime_status, notes)
+            }
+            CpuArchitecture::Unknown => (
+                ArmArchitectureCompatibility::Unknown,
+                ArmRuntimeStatus::Unknown,
+                vec![
+                    "System architecture is unknown; no ARM compatibility assumption was made"
+                        .to_string(),
+                ],
+            ),
+            CpuArchitecture::X86_64 => unreachable!("x86_64 returns before annotation building"),
+        };
+
+        match performance_provenance {
+            ArmPerformanceProvenance::Measured => notes.push(
+                "Performance is measured on matching hardware using existing benchmark identity rules; the current benchmark schema does not independently record architecture"
+                    .to_string(),
+            ),
+            ArmPerformanceProvenance::Estimated => notes.push(
+                "Performance is estimated; no matching measured result is available".to_string(),
+            ),
+            ArmPerformanceProvenance::Unavailable => notes.push(
+                "Performance is unavailable because neither a measurement nor a usable estimate exists"
+                    .to_string(),
+            ),
+        }
+
+        Some(ArmRecommendation {
+            architecture,
+            architecture_compatibility,
+            memory_status,
+            runtime_status,
+            performance_provenance,
+            benchmark_evidence,
+            notes,
+        })
     }
 }
 
@@ -1797,10 +2047,14 @@ mod tests {
 
     fn test_system(ram: f64, has_gpu: bool, vram: Option<f64>) -> SystemSpecs {
         SystemSpecs {
+            architecture: crate::hardware::CpuArchitecture::X86_64,
             total_ram_gb: ram,
             available_ram_gb: ram * 0.8, // simulate some usage
+            physical_cpu_cores: Some(8),
             total_cpu_cores: 8,
             cpu_name: "Test CPU".to_string(),
+            cpu_vendor: None,
+            arm_capabilities: None,
             has_gpu,
             gpu_vram_gb: vram,
             total_gpu_vram_gb: vram, // same as gpu_vram_gb for single-GPU tests
@@ -1821,6 +2075,162 @@ mod tests {
             cluster_mode: false,
             cluster_node_count: 0,
         }
+    }
+
+    fn arm_system(ram: f64) -> SystemSpecs {
+        SystemSpecs {
+            architecture: CpuArchitecture::Aarch64,
+            total_ram_gb: ram,
+            available_ram_gb: ram * 0.8,
+            physical_cpu_cores: Some(8),
+            total_cpu_cores: 8,
+            cpu_name: "Fixture ARM CPU".to_string(),
+            cpu_vendor: Some("ARM".to_string()),
+            arm_capabilities: Some(crate::hardware::ArmCapabilities::unknown()),
+            has_gpu: false,
+            gpu_vram_gb: None,
+            total_gpu_vram_gb: None,
+            gpu_available_gb: None,
+            gpu_name: None,
+            gpu_count: 0,
+            unified_memory: false,
+            backend: GpuBackend::CpuArm,
+            gpus: vec![],
+            cluster_mode: false,
+            cluster_node_count: 0,
+        }
+    }
+
+    #[test]
+    fn arm_recommendation_annotates_aarch64_memory_fit_without_changing_score() {
+        let system = arm_system(32.0);
+        let fit = ModelFit::analyze(&test_model("7B", 4.0, None), &system);
+        let score_before = fit.score;
+
+        let annotation = fit.arm_recommendation(&system).expect("ARM annotation");
+        assert_eq!(annotation.architecture, CpuArchitecture::Aarch64);
+        assert_eq!(
+            annotation.architecture_compatibility,
+            ArmArchitectureCompatibility::Unknown
+        );
+        assert_eq!(annotation.memory_status, ArmMemoryStatus::Fits);
+        assert_eq!(annotation.runtime_status, ArmRuntimeStatus::Detected);
+        assert_eq!(
+            annotation.performance_provenance,
+            ArmPerformanceProvenance::Estimated
+        );
+        assert_eq!(
+            fit.score, score_before,
+            "annotation must not change fit score"
+        );
+    }
+
+    #[test]
+    fn arm_recommendation_reports_insufficient_memory_separately_from_architecture() {
+        let system = arm_system(1.0);
+        let fit = ModelFit::analyze(&test_model("7B", 4.0, None), &system);
+
+        let annotation = fit.arm_recommendation(&system).expect("ARM annotation");
+        assert_eq!(fit.fit_level, FitLevel::TooTight);
+        assert_eq!(annotation.memory_status, ArmMemoryStatus::Insufficient);
+        assert_eq!(
+            annotation.architecture_compatibility,
+            ArmArchitectureCompatibility::Unknown,
+            "memory pressure must not become an ARM architecture claim"
+        );
+    }
+
+    #[test]
+    fn arm_recommendation_reports_unknown_runtime_without_arm_support_evidence() {
+        let system = arm_system(32.0);
+        let fit = ModelFit::analyze(&test_model("7B", 4.0, None), &system);
+
+        let annotation = fit.arm_recommendation(&system).expect("ARM annotation");
+        assert_eq!(fit.runtime, InferenceRuntime::LlamaCpp);
+        assert_eq!(annotation.runtime_status, ArmRuntimeStatus::Detected);
+    }
+
+    #[test]
+    fn arm_recommendation_is_absent_on_x86_64_and_preserves_fit_behavior() {
+        let system = test_system(32.0, false, None);
+        let fit = ModelFit::analyze(&test_model("7B", 4.0, None), &system);
+        let score_before = fit.score;
+
+        assert!(fit.arm_recommendation(&system).is_none());
+        assert_eq!(fit.score, score_before);
+    }
+
+    #[test]
+    fn arm_recommendation_handles_unknown_architecture_without_assumptions() {
+        let mut system = arm_system(32.0);
+        system.architecture = CpuArchitecture::Unknown;
+        let fit = ModelFit::analyze(&test_model("7B", 4.0, None), &system);
+
+        let annotation = fit.arm_recommendation(&system).expect("unknown annotation");
+        assert_eq!(annotation.architecture, CpuArchitecture::Unknown);
+        assert_eq!(
+            annotation.architecture_compatibility,
+            ArmArchitectureCompatibility::Unknown
+        );
+        assert_eq!(annotation.runtime_status, ArmRuntimeStatus::Unknown);
+    }
+
+    #[test]
+    fn arm_recommendation_uses_existing_matching_measurement_provenance() {
+        let system = arm_system(32.0);
+        let mut fit = ModelFit::analyze(&test_model("7B", 4.0, None), &system);
+        // Fixture representing a result already matched by the current
+        // benchmark index; it does not assert a real ARM benchmark.
+        fit.measured_tps = Some(crate::benchmarks::MeasuredTps {
+            tok_s: 12.0,
+            sample_count: 1,
+            hardware_label: "fixture matching hardware".to_string(),
+            source: crate::benchmarks::MeasuredSource::LocalBench,
+            match_level: crate::benchmarks::HardwareMatchLevel::Exact,
+        });
+
+        let annotation = fit.arm_recommendation(&system).expect("ARM annotation");
+        assert_eq!(
+            annotation.performance_provenance,
+            ArmPerformanceProvenance::Measured
+        );
+        assert_eq!(
+            annotation.benchmark_evidence,
+            ArmBenchmarkEvidence::MatchingHardwareMeasurement
+        );
+    }
+
+    #[test]
+    fn arm_recommendation_marks_unmeasured_usable_estimates_as_estimated() {
+        let system = arm_system(32.0);
+        let fit = ModelFit::analyze(&test_model("7B", 4.0, None), &system);
+
+        let annotation = fit.arm_recommendation(&system).expect("ARM annotation");
+        assert!(fit.estimated_tps > 0.0);
+        assert_eq!(
+            annotation.performance_provenance,
+            ArmPerformanceProvenance::Estimated
+        );
+        assert_eq!(
+            annotation.benchmark_evidence,
+            ArmBenchmarkEvidence::Unavailable
+        );
+    }
+
+    #[test]
+    fn arm_recommendation_marks_unsupported_runtime_performance_unavailable() {
+        let system = arm_system(32.0);
+        let mut model = test_model("7B", 4.0, None);
+        model.capabilities.push(models::Capability::Tts);
+        let fit = ModelFit::analyze(&model, &system);
+
+        let annotation = fit.arm_recommendation(&system).expect("ARM annotation");
+        assert_eq!(fit.runtime, InferenceRuntime::Unsupported);
+        assert_eq!(annotation.runtime_status, ArmRuntimeStatus::Unavailable);
+        assert_eq!(
+            annotation.performance_provenance,
+            ArmPerformanceProvenance::Unavailable
+        );
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -2515,10 +2925,14 @@ mod tests {
             (2.0 * vram_gb).max(32.0)
         };
         Some(SystemSpecs {
+            architecture: crate::hardware::CpuArchitecture::X86_64,
             total_ram_gb,
             available_ram_gb: total_ram_gb * 0.85,
+            physical_cpu_cores: Some(16),
             total_cpu_cores: 16,
             cpu_name: "calibration".to_string(),
+            cpu_vendor: None,
+            arm_capabilities: None,
             has_gpu: true,
             gpu_vram_gb: Some(vram_gb),
             total_gpu_vram_gb: Some(vram_gb),
@@ -2902,10 +3316,14 @@ mod tests {
     /// Helper: create a test system with a specific GPU name for bandwidth lookup.
     fn test_system_with_gpu(ram: f64, vram: f64, gpu_name: &str) -> SystemSpecs {
         SystemSpecs {
+            architecture: crate::hardware::CpuArchitecture::X86_64,
             total_ram_gb: ram,
             available_ram_gb: ram * 0.8,
+            physical_cpu_cores: Some(8),
             total_cpu_cores: 8,
             cpu_name: "Test CPU".to_string(),
+            cpu_vendor: None,
+            arm_capabilities: None,
             has_gpu: true,
             gpu_vram_gb: Some(vram),
             total_gpu_vram_gb: Some(vram),
@@ -3487,10 +3905,14 @@ mod tests {
     /// Helper: RX 6900 XT system (512 GB/s theoretical bandwidth).
     fn rx6900xt_system() -> SystemSpecs {
         SystemSpecs {
+            architecture: crate::hardware::CpuArchitecture::X86_64,
             total_ram_gb: 62.0,
             available_ram_gb: 50.0,
+            physical_cpu_cores: Some(16),
             total_cpu_cores: 16,
             cpu_name: "AMD Ryzen 9".to_string(),
+            cpu_vendor: Some("AuthenticAMD".to_string()),
+            arm_capabilities: None,
             has_gpu: true,
             gpu_vram_gb: Some(16.0),
             total_gpu_vram_gb: Some(16.0),

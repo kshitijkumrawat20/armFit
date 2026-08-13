@@ -5190,10 +5190,14 @@ mod tests {
     fn test_app() -> App {
         App::with_specs_and_context(
             SystemSpecs {
+                architecture: llmfit_core::hardware::CpuArchitecture::X86_64,
                 total_ram_gb: 16.0,
                 available_ram_gb: 12.0,
+                physical_cpu_cores: Some(8),
                 total_cpu_cores: 8,
                 cpu_name: "Test CPU".to_string(),
+                cpu_vendor: None,
+                arm_capabilities: None,
                 has_gpu: false,
                 gpu_vram_gb: None,
                 total_gpu_vram_gb: None,

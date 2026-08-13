@@ -603,6 +603,35 @@ EXIT CODES:
 AGENT USAGE:
   No --json support. Parse stdout for progress and completion messages.
   Use --list to enumerate available quantizations before downloading.")]
+    /// Choose the best Arm-friendly model configuration using fit + benchmark evidence
+    #[command(long_about = "\
+Choose the best LLM configuration for the current machine using the existing
+fit and benchmark data. The result distinguishes clearly between measured and
+predicted performance, never treating an estimate as proven runtime evidence.
+
+PRECONDITIONS:
+  Works on any machine; ARM-aware evidence is used when the system is ARM64.
+
+SIDE EFFECTS:
+  None — read-only.
+
+EXIT CODES:
+  0  Success
+  1  No usable optimization recommendation available
+
+AGENT USAGE:
+  llmfit optimize
+  llmfit optimize --json")]
+    Optimize {
+        /// Limit candidate count before ranking
+        #[arg(short = 'n', long, default_value = "10")]
+        limit: usize,
+
+        /// Emit structured JSON instead of a text summary
+        #[arg(long, default_value = "false")]
+        json: bool,
+    },
+
     Download {
         /// Model to download. Can be:
         ///   - HuggingFace repo (e.g. "bartowski/Llama-3.1-8B-Instruct-GGUF")
@@ -3006,6 +3035,54 @@ fn main() {
                     &overrides,
                     context_limit,
                 );
+            }
+
+            Commands::Optimize { limit, json } => {
+                let specs = detect_specs(&overrides);
+                let db = ModelDatabase::new();
+                let result = llmfit_core::optimize_for_system(&specs, &db, limit);
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&result)
+                            .expect("JSON serialization failed for optimization result")
+                    );
+                } else {
+                    let selected = result
+                        .selected_candidate
+                        .as_ref()
+                        .map(|c| format!("{} ({})", c.model.name, c.runtime.label()))
+                        .unwrap_or_else(|| "none".to_string());
+                    let best_measured = result
+                        .best_measured
+                        .as_ref()
+                        .map(|c| {
+                            format!(
+                                "{} ({:.2} tok/s, {:?})",
+                                c.model.name,
+                                c.measured_tps.unwrap_or(0.0),
+                                c.validation_status
+                            )
+                        })
+                        .unwrap_or_else(|| "none".to_string());
+                    let best_predicted = result
+                        .best_predicted
+                        .as_ref()
+                        .map(|c| {
+                            format!(
+                                "{} ({:.2} tok/s, {:?})",
+                                c.model.name, c.estimated_tps, c.validation_status
+                            )
+                        })
+                        .unwrap_or_else(|| "none".to_string());
+                    println!("Architecture: {}", result.hardware_architecture.label());
+                    println!("Selected: {}", selected);
+                    println!("Best measured: {}", best_measured);
+                    println!("Best predicted: {}", best_predicted);
+                    println!("Recommendation: {}", result.recommendation);
+                    println!();
+                    println!("{}", result.explanation);
+                }
             }
 
             Commands::Download {
