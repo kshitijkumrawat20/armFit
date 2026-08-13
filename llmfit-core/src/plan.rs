@@ -870,6 +870,21 @@ fn compute_kv_alternatives(
         .collect()
 }
 
+fn selector_matches_model(model: &LlmModel, selector: &str) -> bool {
+    let needle = selector.trim();
+    if needle.is_empty() {
+        return false;
+    }
+
+    let lower = needle.to_lowercase();
+
+    model.name.to_lowercase() == lower
+        || model.name.to_lowercase().contains(&lower)
+        || model.provider.to_lowercase().contains(&lower)
+        || model.parameter_count.to_lowercase().contains(&lower)
+        || crate::providers::tag_matches_model(needle, &model.name)
+}
+
 pub fn resolve_model_selector<'a>(
     models: &'a [LlmModel],
     selector: &str,
@@ -881,7 +896,7 @@ pub fn resolve_model_selector<'a>(
 
     let exact: Vec<&LlmModel> = models
         .iter()
-        .filter(|m| m.name.to_lowercase() == needle)
+        .filter(|m| selector_matches_model(m, selector) && m.name.to_lowercase() == needle)
         .collect();
     if exact.len() == 1 {
         return Ok(exact[0]);
@@ -889,7 +904,7 @@ pub fn resolve_model_selector<'a>(
 
     let partial: Vec<&LlmModel> = models
         .iter()
-        .filter(|m| m.name.to_lowercase().contains(&needle))
+        .filter(|m| selector_matches_model(m, selector))
         .collect();
 
     match partial.len() {
@@ -1870,6 +1885,17 @@ mod tests {
         let models = vec![test_model()];
         let found = resolve_model_selector(&models, "test-7b").expect("partial match");
         assert_eq!(found.name, "Qwen-Test-7B");
+    }
+
+    #[test]
+    fn test_resolve_model_selector_accepts_ollama_tag_alias() {
+        let mut model = test_model();
+        model.name = "Qwen/Qwen2.5-1.5B-Instruct".to_string();
+        let models = vec![model];
+
+        let found = resolve_model_selector(&models, "qwen2.5:1.5b")
+            .expect("Ollama tag should resolve to the catalog model");
+        assert_eq!(found.name, "Qwen/Qwen2.5-1.5B-Instruct");
     }
 
     // ── upgrade_deltas ───────────────────────────────────────────────

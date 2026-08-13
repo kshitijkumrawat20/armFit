@@ -1188,16 +1188,16 @@ fn find_name_index_by_selector<T>(
     selector: &str,
     get_name: impl Fn(&T) -> &str,
 ) -> Result<usize, String> {
-    let needle = selector.trim().to_lowercase();
+    let needle = selector.trim();
     if needle.is_empty() {
         return Err("Model selector cannot be empty".to_string());
     }
 
-    if let Some((idx, _)) = items
-        .iter()
-        .enumerate()
-        .find(|(_, item)| get_name(item).to_lowercase() == needle)
-    {
+    let lower = needle.to_lowercase();
+    if let Some((idx, _)) = items.iter().enumerate().find(|(_, item)| {
+        let name = get_name(item);
+        name.to_lowercase() == lower || llmfit_core::providers::tag_matches_model(needle, name)
+    }) {
         return Ok(idx);
     }
 
@@ -1206,7 +1206,7 @@ fn find_name_index_by_selector<T>(
         .enumerate()
         .filter_map(|(i, item)| {
             let name = get_name(item);
-            if name.to_lowercase().contains(&needle) {
+            if name.to_lowercase().contains(&lower) || llmfit_core::providers::tag_matches_model(needle, name) {
                 Some((i, name.to_string()))
             } else {
                 None
