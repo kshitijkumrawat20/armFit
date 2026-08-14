@@ -22,7 +22,7 @@ use llmfit_core::fit::{FitLevel, ModelFit, SortColumn};
 use llmfit_core::hardware::is_running_in_wsl;
 use llmfit_core::optimization::{OptimizationProvenance, RuntimeAvailability};
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const DM_MODELS_DIR_LABEL: &str = "  Models dir:  ";
 
@@ -1848,8 +1848,8 @@ fn draw_optimize(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(4),
-            Constraint::Min(8),
-            Constraint::Length(1),
+            Constraint::Min(10),
+            Constraint::Min(2),
         ])
         .split(inner);
 
@@ -1913,10 +1913,40 @@ fn draw_optimize(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
         sections[0],
     );
 
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(sections[1]);
+    let card_area = sections[1];
+    let card_sections = if card_area.width >= 80 {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(card_area)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(card_area)
+    };
+
+    fn truncate_model_name(name: &str, max_width: usize) -> String {
+        if max_width == 0 {
+            return String::new();
+        }
+        let display_width = name.width();
+        if display_width <= max_width {
+            return name.to_string();
+        }
+        let mut result = String::new();
+        let mut current_width = 0;
+        for c in name.chars() {
+            let w = c.width().unwrap_or(0);
+            if current_width + w + 3 > max_width {
+                result.push_str("...");
+                break;
+            }
+            result.push(c);
+            current_width += w;
+        }
+        result
+    }
 
     let measured_lines = if let Some(cand) = &result.best_measured {
         let provenance_lbl = provenance_label(cand.performance_provenance);
@@ -1928,36 +1958,43 @@ fn draw_optimize(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
                 .map(|m| m.source)
                 .unwrap_or(MeasuredSource::Community),
         );
-        let hw_lbl = cand
-            .fit
-            .measured_tps
-            .as_ref()
-            .map(|m| m.hardware_label.as_str())
-            .unwrap_or("");
+
+        let max_name_width = card_sections[0].width.saturating_sub(8) as usize;
+        let model_name = truncate_model_name(&cand.model.name, max_name_width);
 
         vec![
             Line::from(Span::styled(
                 "── BEST MEASURED ──",
                 Style::default().fg(tc.good).add_modifier(Modifier::BOLD),
             )),
+            Line::from(""),
             Line::from(vec![
                 Span::styled("Model: ", Style::default().fg(tc.muted)),
-                Span::styled(&cand.model.name, Style::default().fg(tc.fg).bold()),
+                Span::styled(model_name, Style::default().fg(tc.fg).bold()),
             ]),
             Line::from(Span::styled(
                 format!("{:.2} tok/s", cand.measured_tps.unwrap_or(0.0)),
-                Style::default().fg(tc.good).bold(),
+                Style::default().fg(tc.good).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                format!("{} HARDWARE", match_lbl.to_uppercase()),
+                Style::default().fg(tc.info).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                provenance_lbl,
+                Style::default().fg(tc.good).add_modifier(Modifier::BOLD),
             )),
             Line::from(vec![
+                Span::styled("Runtime: ", Style::default().fg(tc.muted)),
+                Span::styled(cand.runtime.label(), Style::default().fg(tc.fg)),
                 Span::styled(
-                    format!("{}  {}", match_lbl, provenance_lbl),
-                    Style::default().fg(tc.info),
+                    format!("  ({})", runtime_avail_label(cand.runtime_availability)),
+                    Style::default().fg(tc.muted),
                 ),
-                Span::styled(format!("  [{}]", source_lbl), Style::default().fg(tc.good)),
             ]),
             Line::from(vec![
-                Span::styled("Hardware: ", Style::default().fg(tc.muted)),
-                Span::styled(hw_lbl, Style::default().fg(tc.fg)),
+                Span::styled("Source: ", Style::default().fg(tc.muted)),
+                Span::styled(source_lbl, Style::default().fg(tc.fg)),
             ]),
         ]
     } else {
@@ -1966,6 +2003,7 @@ fn draw_optimize(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
                 "── BEST MEASURED ──",
                 Style::default().fg(tc.good).add_modifier(Modifier::BOLD),
             )),
+            Line::from(""),
             Line::from(Span::styled(
                 "No measured benchmark available for this hardware.",
                 Style::default().fg(tc.muted),
@@ -1975,32 +2013,51 @@ fn draw_optimize(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
 
     frame.render_widget(
         Paragraph::new(measured_lines).wrap(Wrap { trim: true }),
-        cols[0],
+        card_sections[0],
     );
 
     let predicted_lines = if let Some(cand) = &result.best_predicted {
         let provenance_lbl = provenance_label(cand.performance_provenance);
+
+        let max_name_width = card_sections[1].width.saturating_sub(8) as usize;
+        let model_name = truncate_model_name(&cand.model.name, max_name_width);
 
         vec![
             Line::from(Span::styled(
                 "── BEST PREDICTED ──",
                 Style::default().fg(tc.warning).add_modifier(Modifier::BOLD),
             )),
+            Line::from(""),
             Line::from(vec![
                 Span::styled("Model: ", Style::default().fg(tc.muted)),
-                Span::styled(&cand.model.name, Style::default().fg(tc.fg).bold()),
+                Span::styled(model_name, Style::default().fg(tc.fg).bold()),
             ]),
             Line::from(Span::styled(
                 format!("{:.1} tok/s", cand.estimated_tps),
-                Style::default().fg(tc.warning).bold(),
+                Style::default().fg(tc.warning).add_modifier(Modifier::BOLD),
             )),
             Line::from(Span::styled(
-                format!("{}  NO BENCHMARK", provenance_lbl),
-                Style::default().fg(tc.muted),
+                provenance_lbl,
+                Style::default().fg(tc.warning).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                "NO BENCHMARK",
+                Style::default().fg(tc.muted).add_modifier(Modifier::BOLD),
             )),
             Line::from(vec![
                 Span::styled("Runtime: ", Style::default().fg(tc.muted)),
                 Span::styled(cand.runtime.label(), Style::default().fg(tc.fg)),
+                Span::styled(
+                    format!("  ({})", runtime_avail_label(cand.runtime_availability)),
+                    Style::default().fg(tc.muted),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("Fit: ", Style::default().fg(tc.muted)),
+                Span::styled(
+                    cand.fit.fit_text(),
+                    Style::default().fg(fit_color(cand.fit.fit_level, tc)),
+                ),
             ]),
         ]
     } else {
@@ -2009,6 +2066,7 @@ fn draw_optimize(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
                 "── BEST PREDICTED ──",
                 Style::default().fg(tc.warning).add_modifier(Modifier::BOLD),
             )),
+            Line::from(""),
             Line::from(Span::styled(
                 "No predicted candidate available.",
                 Style::default().fg(tc.muted),
@@ -2018,13 +2076,55 @@ fn draw_optimize(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
 
     frame.render_widget(
         Paragraph::new(predicted_lines).wrap(Wrap { trim: true }),
-        cols[1],
+        card_sections[1],
     );
 
-    let explanation_line = Line::from(vec![
-        Span::styled("  ", Style::default()),
-        Span::styled(&result.explanation, Style::default().fg(tc.fg)),
-    ]);
+    let explanation_line = if let (Some(m), Some(p)) =
+        (&result.best_measured, &result.best_predicted)
+    {
+        Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(
+                format!(
+                    "Measured candidate: {} — {:.2} tok/s on this exact ARM64 machine. Predicted candidate: {} — {:.1} tok/s (no benchmark evidence).",
+                    m.model.name,
+                    m.measured_tps.unwrap_or(0.0),
+                    p.model.name,
+                    p.estimated_tps
+                ),
+                Style::default().fg(tc.fg),
+            ),
+        ])
+    } else if let Some(m) = &result.best_measured {
+        Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(
+                format!(
+                    "Measured candidate: {} — {:.2} tok/s on this exact ARM64 machine.",
+                    m.model.name,
+                    m.measured_tps.unwrap_or(0.0)
+                ),
+                Style::default().fg(tc.fg),
+            ),
+        ])
+    } else if let Some(p) = &result.best_predicted {
+        Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(
+                format!(
+                    "Predicted candidate: {} — {:.1} tok/s (no benchmark evidence).",
+                    p.model.name, p.estimated_tps
+                ),
+                Style::default().fg(tc.fg),
+            ),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(&result.explanation, Style::default().fg(tc.fg)),
+        ])
+    };
+
     frame.render_widget(Paragraph::new(explanation_line), sections[2]);
 }
 
@@ -6250,11 +6350,8 @@ mod tests {
 
     #[test]
     fn draw_optimize_renders_without_panic() {
-        use ratatui::backend::TestBackend;
         use ratatui::Terminal;
-
-        let backend = TestBackend::new(80, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
+        use ratatui::backend::TestBackend;
 
         let mut app = App::with_specs_and_context(
             llmfit_core::hardware::SystemSpecs {
@@ -6282,13 +6379,37 @@ mod tests {
         );
         app.open_optimize();
 
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|f| {
                 draw_optimize(f, &app, f.area(), &app.theme.colors());
             })
             .unwrap();
 
-        let mut app2 = App::with_specs_and_context(
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                draw_optimize(f, &app, f.area(), &app.theme.colors());
+            })
+            .unwrap();
+
+        let backend = TestBackend::new(40, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                draw_optimize(f, &app, f.area(), &app.theme.colors());
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn draw_optimize_renders_predicted_only_without_panic() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = App::with_specs_and_context(
             llmfit_core::hardware::SystemSpecs {
                 architecture: llmfit_core::hardware::CpuArchitecture::X86_64,
                 total_ram_gb: 32.0,
@@ -6312,11 +6433,21 @@ mod tests {
             },
             None,
         );
-        app2.open_optimize();
+        app.open_optimize();
 
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|f| {
-                draw_optimize(f, &app2, f.area(), &app2.theme.colors());
+                draw_optimize(f, &app, f.area(), &app.theme.colors());
+            })
+            .unwrap();
+
+        let backend = TestBackend::new(40, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                draw_optimize(f, &app, f.area(), &app.theme.colors());
             })
             .unwrap();
     }
