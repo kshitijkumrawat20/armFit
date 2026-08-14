@@ -1835,93 +1835,90 @@ fn draw_optimize(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
         }
     };
 
-    let mut lines: Vec<Line> = Vec::new();
-    lines.push(Line::from(""));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(tc.border))
+        .title(" Optimize ")
+        .title_style(Style::default().fg(tc.accent_secondary).bold());
 
-    // System info header
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(4),
+            Constraint::Min(8),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
     let arch_label = result.hardware_architecture.label();
-    let ram_gb = app.specs.total_ram_gb;
-    let cpu_name = &app.specs.cpu_name;
-
-    lines.push(Line::from(vec![
-        Span::styled("  Architecture: ", Style::default().fg(tc.muted)),
-        Span::styled(arch_label, Style::default().fg(tc.fg).bold()),
-    ]));
-
-    lines.push(Line::from(vec![
-        Span::styled("  CPU:         ", Style::default().fg(tc.muted)),
-        Span::styled(cpu_name, Style::default().fg(tc.fg)),
-    ]));
-
-    lines.push(Line::from(vec![
-        Span::styled("  RAM:         ", Style::default().fg(tc.muted)),
-        Span::styled(
-            format!(
-                "{:.1} GB total ({:.1} GB avail)",
-                ram_gb, app.specs.available_ram_gb
+    let header_lines = vec![
+        Line::from(vec![
+            Span::styled(arch_label, Style::default().fg(tc.fg).bold()),
+            Span::styled("  │  ", Style::default().fg(tc.muted)),
+            Span::styled("Ollama: ", Style::default().fg(tc.muted)),
+            Span::styled(
+                if app.ollama_available {
+                    "✓ available"
+                } else {
+                    "✗ not detected"
+                },
+                Style::default().fg(if app.ollama_available {
+                    tc.good
+                } else {
+                    tc.muted
+                }),
             ),
-            Style::default().fg(tc.fg),
-        ),
-    ]));
+            Span::styled("  │  ", Style::default().fg(tc.muted)),
+            Span::styled("ARM-aware: ", Style::default().fg(tc.muted)),
+            Span::styled(
+                if result.is_arm_aware { "yes" } else { "no" },
+                Style::default().fg(tc.info),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("CPU: ", Style::default().fg(tc.muted)),
+            Span::styled(&app.specs.cpu_name, Style::default().fg(tc.fg)),
+            Span::styled("  │  ", Style::default().fg(tc.muted)),
+            Span::styled("RAM: ", Style::default().fg(tc.muted)),
+            Span::styled(
+                format!(
+                    "{:.1} GB total ({:.1} GB avail)",
+                    app.specs.total_ram_gb, app.specs.available_ram_gb
+                ),
+                Style::default().fg(tc.fg),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Selected: ", Style::default().fg(tc.muted)),
+            Span::styled(
+                result
+                    .selected_candidate
+                    .as_ref()
+                    .map(|c| format!("{} ({})", c.model.name, c.runtime.label()))
+                    .unwrap_or_else(|| "none".to_string()),
+                Style::default().fg(tc.fg).bold(),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Recommendation: ", Style::default().fg(tc.muted)),
+            Span::styled(&result.recommendation, Style::default().fg(tc.accent)),
+        ]),
+    ];
 
-    lines.push(Line::from(vec![
-        Span::styled("  Ollama:      ", Style::default().fg(tc.muted)),
-        Span::styled(
-            if app.ollama_available {
-                "✓ available"
-            } else {
-                "✗ not detected"
-            },
-            if app.ollama_available {
-                Style::default().fg(tc.good)
-            } else {
-                Style::default().fg(tc.muted)
-            },
-        ),
-    ]));
+    frame.render_widget(
+        Paragraph::new(header_lines).wrap(Wrap { trim: true }),
+        sections[0],
+    );
 
-    // ARM-aware flag
-    let arm_text = if result.is_arm_aware {
-        format!("  ARM-aware:   yes ({})", arch_label)
-    } else {
-        format!("  ARM-aware:   no ({})", arch_label)
-    };
-    lines.push(Line::from(Span::styled(
-        arm_text,
-        Style::default().fg(tc.info),
-    )));
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(sections[1]);
 
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "  ── Recommendation ──",
-        Style::default().fg(tc.accent),
-    )));
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled("  Selected:    ", Style::default().fg(tc.muted)),
-        Span::styled(
-            result
-                .selected_candidate
-                .as_ref()
-                .map(|c| format!("{} ({})", c.model.name, c.runtime.label()))
-                .unwrap_or_else(|| "none".to_string()),
-            Style::default().fg(tc.fg).bold(),
-        ),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("  Recommendation:", Style::default().fg(tc.muted)),
-        Span::styled(&result.recommendation, Style::default().fg(tc.accent)),
-    ]));
-    lines.push(Line::from(""));
-
-    // BEST MEASURED
-    lines.push(Line::from(Span::styled(
-        "  ── Best Measured ──",
-        Style::default().fg(tc.good).add_modifier(Modifier::BOLD),
-    )));
-    lines.push(Line::from(""));
-
-    if let Some(cand) = &result.best_measured {
+    let measured_lines = if let Some(cand) = &result.best_measured {
         let provenance_lbl = provenance_label(cand.performance_provenance);
         let match_lbl = match_level_label(cand.benchmark_match_level);
         let source_lbl = measured_source_label(
@@ -1931,146 +1928,104 @@ fn draw_optimize(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
                 .map(|m| m.source)
                 .unwrap_or(MeasuredSource::Community),
         );
+        let hw_lbl = cand
+            .fit
+            .measured_tps
+            .as_ref()
+            .map(|m| m.hardware_label.as_str())
+            .unwrap_or("");
 
-        lines.push(Line::from(vec![
-            Span::styled("  Model:       ", Style::default().fg(tc.muted)),
-            Span::styled(&cand.model.name, Style::default().fg(tc.fg).bold()),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("  Measured TPS:", Style::default().fg(tc.muted)),
-            Span::styled(
-                format!(" {:.2} tok/s", cand.measured_tps.unwrap_or(0.0)),
+        vec![
+            Line::from(Span::styled(
+                "── BEST MEASURED ──",
+                Style::default().fg(tc.good).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(vec![
+                Span::styled("Model: ", Style::default().fg(tc.muted)),
+                Span::styled(&cand.model.name, Style::default().fg(tc.fg).bold()),
+            ]),
+            Line::from(Span::styled(
+                format!("{:.2} tok/s", cand.measured_tps.unwrap_or(0.0)),
                 Style::default().fg(tc.good).bold(),
-            ),
-            Span::styled(
-                format!("  [{}]", provenance_lbl),
-                Style::default().fg(tc.good),
-            ),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("  Match Level: ", Style::default().fg(tc.muted)),
-            Span::styled(match_lbl, Style::default().fg(tc.info)),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("  Hardware:    ", Style::default().fg(tc.muted)),
-            Span::styled(
-                cand.fit
-                    .measured_tps
-                    .as_ref()
-                    .map(|m| m.hardware_label.as_str())
-                    .unwrap_or(""),
-                Style::default().fg(tc.fg),
-            ),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("  Runtime:     ", Style::default().fg(tc.muted)),
-            Span::styled(cand.runtime.label(), Style::default().fg(tc.fg)),
-            Span::styled(
-                format!(
-                    "  (state: {})",
-                    runtime_avail_label(cand.runtime_availability)
+            )),
+            Line::from(vec![
+                Span::styled(
+                    format!("{}  {}", match_lbl, provenance_lbl),
+                    Style::default().fg(tc.info),
                 ),
-                Style::default().fg(tc.muted),
-            ),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("  Source:      ", Style::default().fg(tc.muted)),
-            Span::styled(source_lbl, Style::default().fg(tc.fg)),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("  Est. TPS:    ", Style::default().fg(tc.muted)),
-            Span::styled(
-                format!(" {:.1} tok/s (formula)", cand.estimated_tps),
-                Style::default().fg(tc.muted),
-            ),
-        ]));
+                Span::styled(format!("  [{}]", source_lbl), Style::default().fg(tc.good)),
+            ]),
+            Line::from(vec![
+                Span::styled("Hardware: ", Style::default().fg(tc.muted)),
+                Span::styled(hw_lbl, Style::default().fg(tc.fg)),
+            ]),
+        ]
     } else {
-        lines.push(Line::from(Span::styled(
-            "  No measured benchmark available for this hardware.",
-            Style::default().fg(tc.muted),
-        )));
-    }
+        vec![
+            Line::from(Span::styled(
+                "── BEST MEASURED ──",
+                Style::default().fg(tc.good).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                "No measured benchmark available for this hardware.",
+                Style::default().fg(tc.muted),
+            )),
+        ]
+    };
 
-    lines.push(Line::from(""));
+    frame.render_widget(
+        Paragraph::new(measured_lines).wrap(Wrap { trim: true }),
+        cols[0],
+    );
 
-    // BEST PREDICTED
-    lines.push(Line::from(Span::styled(
-        "  ── Best Predicted ──",
-        Style::default().fg(tc.warning).add_modifier(Modifier::BOLD),
-    )));
-    lines.push(Line::from(""));
-
-    if let Some(cand) = &result.best_predicted {
+    let predicted_lines = if let Some(cand) = &result.best_predicted {
         let provenance_lbl = provenance_label(cand.performance_provenance);
 
-        lines.push(Line::from(vec![
-            Span::styled("  Model:       ", Style::default().fg(tc.muted)),
-            Span::styled(&cand.model.name, Style::default().fg(tc.fg).bold()),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("  Est. TPS:    ", Style::default().fg(tc.muted)),
-            Span::styled(
-                format!(" {:.1} tok/s", cand.estimated_tps),
+        vec![
+            Line::from(Span::styled(
+                "── BEST PREDICTED ──",
+                Style::default().fg(tc.warning).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(vec![
+                Span::styled("Model: ", Style::default().fg(tc.muted)),
+                Span::styled(&cand.model.name, Style::default().fg(tc.fg).bold()),
+            ]),
+            Line::from(Span::styled(
+                format!("{:.1} tok/s", cand.estimated_tps),
                 Style::default().fg(tc.warning).bold(),
-            ),
-            Span::styled(
-                format!("  [{}]", provenance_lbl),
-                Style::default().fg(tc.warning),
-            ),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("  Match Level: ", Style::default().fg(tc.muted)),
-            Span::styled(
-                "No matching benchmark (estimated only)",
+            )),
+            Line::from(Span::styled(
+                format!("{}  NO BENCHMARK", provenance_lbl),
                 Style::default().fg(tc.muted),
-            ),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("  Runtime:     ", Style::default().fg(tc.muted)),
-            Span::styled(cand.runtime.label(), Style::default().fg(tc.fg)),
-            Span::styled(
-                format!(
-                    "  (state: {})",
-                    runtime_avail_label(cand.runtime_availability)
-                ),
-                Style::default().fg(tc.muted),
-            ),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("  Fit Level:   ", Style::default().fg(tc.muted)),
-            Span::styled(
-                cand.fit.fit_text(),
-                Style::default().fg(fit_color(cand.fit.fit_level, tc)),
-            ),
-        ]));
+            )),
+            Line::from(vec![
+                Span::styled("Runtime: ", Style::default().fg(tc.muted)),
+                Span::styled(cand.runtime.label(), Style::default().fg(tc.fg)),
+            ]),
+        ]
     } else {
-        lines.push(Line::from(Span::styled(
-            "  No predicted candidate available.",
-            Style::default().fg(tc.muted),
-        )));
-    }
+        vec![
+            Line::from(Span::styled(
+                "── BEST PREDICTED ──",
+                Style::default().fg(tc.warning).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                "No predicted candidate available.",
+                Style::default().fg(tc.muted),
+            )),
+        ]
+    };
 
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "  ── Explanation ──",
-        Style::default().fg(tc.accent),
-    )));
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        format!("  {}", result.explanation),
-        Style::default().fg(tc.fg),
-    )));
+    frame.render_widget(
+        Paragraph::new(predicted_lines).wrap(Wrap { trim: true }),
+        cols[1],
+    );
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(tc.border))
-        .title(" Optimize ")
-        .title_style(Style::default().fg(tc.accent_secondary).bold());
-
-    let paragraph = Paragraph::new(lines)
-        .block(block)
-        .wrap(Wrap { trim: false });
-    frame.render_widget(paragraph, area);
+    let explanation_line = Line::from(vec![
+        Span::styled("  ", Style::default()),
+        Span::styled(&result.explanation, Style::default().fg(tc.fg)),
+    ]);
+    frame.render_widget(Paragraph::new(explanation_line), sections[2]);
 }
 
 fn draw_detail(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
@@ -6291,5 +6246,78 @@ mod tests {
             measured_source_label(MeasuredSource::LocalBench),
             "local bench"
         );
+    }
+
+    #[test]
+    fn draw_optimize_renders_without_panic() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut app = App::with_specs_and_context(
+            llmfit_core::hardware::SystemSpecs {
+                architecture: llmfit_core::hardware::CpuArchitecture::Aarch64,
+                total_ram_gb: 16.0,
+                available_ram_gb: 14.0,
+                physical_cpu_cores: Some(8),
+                total_cpu_cores: 8,
+                cpu_name: "Cortex-A78".to_string(),
+                cpu_vendor: Some("arm".to_string()),
+                arm_capabilities: None,
+                has_gpu: false,
+                gpu_vram_gb: None,
+                total_gpu_vram_gb: None,
+                gpu_available_gb: None,
+                gpu_name: None,
+                gpu_count: 0,
+                unified_memory: false,
+                backend: llmfit_core::hardware::GpuBackend::CpuArm,
+                gpus: Vec::new(),
+                cluster_mode: false,
+                cluster_node_count: 0,
+            },
+            None,
+        );
+        app.open_optimize();
+
+        terminal
+            .draw(|f| {
+                draw_optimize(f, &app, f.area(), &app.theme.colors());
+            })
+            .unwrap();
+
+        let mut app2 = App::with_specs_and_context(
+            llmfit_core::hardware::SystemSpecs {
+                architecture: llmfit_core::hardware::CpuArchitecture::X86_64,
+                total_ram_gb: 32.0,
+                available_ram_gb: 28.0,
+                physical_cpu_cores: Some(16),
+                total_cpu_cores: 16,
+                cpu_name: "Intel Core i9".to_string(),
+                cpu_vendor: Some("intel".to_string()),
+                arm_capabilities: None,
+                has_gpu: false,
+                gpu_vram_gb: None,
+                total_gpu_vram_gb: None,
+                gpu_available_gb: None,
+                gpu_name: None,
+                gpu_count: 0,
+                unified_memory: false,
+                backend: llmfit_core::hardware::GpuBackend::CpuX86,
+                gpus: Vec::new(),
+                cluster_mode: false,
+                cluster_node_count: 0,
+            },
+            None,
+        );
+        app2.open_optimize();
+
+        terminal
+            .draw(|f| {
+                draw_optimize(f, &app2, f.area(), &app2.theme.colors());
+            })
+            .unwrap();
     }
 }
