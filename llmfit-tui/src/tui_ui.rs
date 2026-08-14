@@ -1964,6 +1964,10 @@ fn draw_optimize(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
 
         vec![
             Line::from(Span::styled(
+                "OPTIMIZED FOR THIS MACHINE",
+                Style::default().fg(tc.accent).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
                 "── BEST MEASURED ──",
                 Style::default().fg(tc.good).add_modifier(Modifier::BOLD),
             )),
@@ -1996,6 +2000,11 @@ fn draw_optimize(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
                 Span::styled("Source: ", Style::default().fg(tc.muted)),
                 Span::styled(source_lbl, Style::default().fg(tc.fg)),
             ]),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Real benchmark from this exact machine.",
+                Style::default().fg(tc.good),
+            )),
         ]
     } else {
         vec![
@@ -2024,7 +2033,7 @@ fn draw_optimize(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
 
         vec![
             Line::from(Span::styled(
-                "── BEST PREDICTED ──",
+                "── PREDICTED / UNBENCHMARKED ──",
                 Style::default().fg(tc.warning).add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
@@ -2033,7 +2042,7 @@ fn draw_optimize(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
                 Span::styled(model_name, Style::default().fg(tc.fg).bold()),
             ]),
             Line::from(Span::styled(
-                format!("{:.1} tok/s", cand.estimated_tps),
+                format!("{:.1} tok/s ESTIMATE", cand.estimated_tps),
                 Style::default().fg(tc.warning).add_modifier(Modifier::BOLD),
             )),
             Line::from(Span::styled(
@@ -2059,11 +2068,16 @@ fn draw_optimize(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
                     Style::default().fg(fit_color(cand.fit.fit_level, tc)),
                 ),
             ]),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Estimate only — no benchmark evidence.",
+                Style::default().fg(tc.warning),
+            )),
         ]
     } else {
         vec![
             Line::from(Span::styled(
-                "── BEST PREDICTED ──",
+                "── PREDICTED / UNBENCHMARKED ──",
                 Style::default().fg(tc.warning).add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
@@ -2079,53 +2093,40 @@ fn draw_optimize(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
         card_sections[1],
     );
 
-    let explanation_line = if let (Some(m), Some(p)) =
-        (&result.best_measured, &result.best_predicted)
-    {
-        Line::from(vec![
-            Span::styled("  ", Style::default()),
-            Span::styled(
-                format!(
-                    "Measured candidate: {} — {:.2} tok/s on this exact ARM64 machine. Predicted candidate: {} — {:.1} tok/s (no benchmark evidence).",
-                    m.model.name,
-                    m.measured_tps.unwrap_or(0.0),
-                    p.model.name,
-                    p.estimated_tps
+    let explanation_lines: Vec<Line> = if let Some(m) = &result.best_measured {
+        vec![
+            Line::from(vec![
+                Span::styled("  ✓ Measured on this exact ", Style::default().fg(tc.fg)),
+                Span::styled(
+                    result.hardware_architecture.label(),
+                    Style::default().fg(tc.fg).bold(),
                 ),
-                Style::default().fg(tc.fg),
-            ),
-        ])
-    } else if let Some(m) = &result.best_measured {
-        Line::from(vec![
-            Span::styled("  ", Style::default()),
-            Span::styled(
-                format!(
-                    "Measured candidate: {} — {:.2} tok/s on this exact ARM64 machine.",
-                    m.model.name,
-                    m.measured_tps.unwrap_or(0.0)
+                Span::styled(
+                    format!(" machine: {:.2} tok/s", m.measured_tps.unwrap_or(0.0)),
+                    Style::default().fg(tc.fg),
                 ),
+            ]),
+            Line::from(Span::styled(
+                "  Predicted values are estimates without benchmark evidence.",
                 Style::default().fg(tc.fg),
-            ),
-        ])
+            )),
+        ]
     } else if let Some(p) = &result.best_predicted {
-        Line::from(vec![
-            Span::styled("  ", Style::default()),
-            Span::styled(
-                format!(
-                    "Predicted candidate: {} — {:.1} tok/s (no benchmark evidence).",
-                    p.model.name, p.estimated_tps
-                ),
-                Style::default().fg(tc.fg),
+        vec![Line::from(Span::styled(
+            format!(
+                "  Predicted: {:.1} tok/s — estimate only, no benchmark evidence.",
+                p.estimated_tps
             ),
-        ])
+            Style::default().fg(tc.fg),
+        ))]
     } else {
-        Line::from(vec![
-            Span::styled("  ", Style::default()),
-            Span::styled(&result.explanation, Style::default().fg(tc.fg)),
-        ])
+        vec![Line::from(Span::styled(
+            format!("  {}", result.explanation),
+            Style::default().fg(tc.fg),
+        ))]
     };
 
-    frame.render_widget(Paragraph::new(explanation_line), sections[2]);
+    frame.render_widget(Paragraph::new(explanation_lines), sections[2]);
 }
 
 fn draw_detail(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
@@ -6450,5 +6451,85 @@ mod tests {
                 draw_optimize(f, &app, f.area(), &app.theme.colors());
             })
             .unwrap();
+    }
+
+    #[test]
+    fn draw_optimize_labels_distinguish_measured_and_predicted() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = App::with_specs_and_context(
+            llmfit_core::hardware::SystemSpecs {
+                architecture: llmfit_core::hardware::CpuArchitecture::Aarch64,
+                total_ram_gb: 16.0,
+                available_ram_gb: 14.0,
+                physical_cpu_cores: Some(8),
+                total_cpu_cores: 8,
+                cpu_name: "Cortex-A78".to_string(),
+                cpu_vendor: Some("arm".to_string()),
+                arm_capabilities: None,
+                has_gpu: false,
+                gpu_vram_gb: None,
+                total_gpu_vram_gb: None,
+                gpu_available_gb: None,
+                gpu_name: None,
+                gpu_count: 0,
+                unified_memory: false,
+                backend: llmfit_core::hardware::GpuBackend::CpuArm,
+                gpus: Vec::new(),
+                cluster_mode: false,
+                cluster_node_count: 0,
+            },
+            None,
+        );
+        app.open_optimize();
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                draw_optimize(f, &app, f.area(), &app.theme.colors());
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area;
+        let mut text = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                if let Some(cell) = buffer.cell((x, y)) {
+                    text.push_str(cell.symbol());
+                }
+            }
+            text.push('\n');
+        }
+
+        let has_measured = app
+            .optimize_result
+            .as_ref()
+            .and_then(|r| r.best_measured.as_ref())
+            .is_some();
+        let has_predicted = app
+            .optimize_result
+            .as_ref()
+            .and_then(|r| r.best_predicted.as_ref())
+            .is_some();
+
+        if has_measured {
+            assert!(text.contains("OPTIMIZED FOR THIS MACHINE"));
+            assert!(text.contains("BEST MEASURED"));
+            assert!(text.contains("Real benchmark from this exact machine."));
+        }
+        if has_predicted {
+            assert!(text.contains("PREDICTED / UNBENCHMARKED"));
+            assert!(text.contains("tok/s ESTIMATE"));
+            if has_measured {
+                assert!(
+                    text.contains("Predicted values are estimates without benchmark evidence.")
+                );
+            } else {
+                assert!(text.contains("estimate only, no benchmark evidence."));
+            }
+        }
     }
 }

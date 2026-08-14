@@ -4273,7 +4273,7 @@ impl App {
         let Some(fit) = self.selected_fit() else {
             return;
         };
-        if fit.installed {
+        if fit.installed || self.installed.is_installed(&fit.model.name) {
             self.pull_status = Some("Already installed".to_string());
             return;
         }
@@ -4299,7 +4299,7 @@ impl App {
                 || self.lmstudio_available
                 || self.vllm_available;
             self.pull_status = Some(if any_runtime {
-                Self::format_no_download_message(model_format, is_mlx_model)
+                Self::format_no_download_message(model_format, is_mlx_model, has_catalog_gguf)
             } else {
                 "No runtime available — install Ollama, llama.cpp, Docker, LM Studio, or vLLM"
                     .to_string()
@@ -4308,26 +4308,30 @@ impl App {
     }
 
     /// Build a user-friendly message explaining why no download is available,
-    /// based on the model's weight format.
+    /// based on the model's weight format and catalog sources.
     fn format_no_download_message(
         format: llmfit_core::models::ModelFormat,
         is_mlx_model: bool,
+        has_catalog_gguf: bool,
     ) -> String {
         use llmfit_core::models::ModelFormat;
         if is_mlx_model {
-            "MLX model — requires Apple Silicon with MLX installed".to_string()
-        } else {
-            match format {
-                ModelFormat::Awq => {
-                    "AWQ model — requires vLLM or a CUDA/ROCm GPU; no GGUF conversion available"
-                        .to_string()
-                }
-                ModelFormat::Gptq => {
-                    "GPTQ model — requires vLLM or a CUDA/ROCm GPU; no GGUF conversion available"
-                        .to_string()
-                }
-                _ => "No downloadable format found for this model".to_string(),
+            return "MLX model — requires Apple Silicon with MLX installed".to_string();
+        }
+        if has_catalog_gguf {
+            return "GGUF sources available — install llama.cpp or LM Studio to download"
+                .to_string();
+        }
+        match format {
+            ModelFormat::Awq => {
+                "AWQ model — requires vLLM or a CUDA/ROCm GPU; no GGUF conversion available"
+                    .to_string()
             }
+            ModelFormat::Gptq => {
+                "GPTQ model — requires vLLM or a CUDA/ROCm GPU; no GGUF conversion available"
+                    .to_string()
+            }
+            _ => "No downloadable format found for this model".to_string(),
         }
     }
 
@@ -5465,6 +5469,60 @@ mod tests {
             true,
         );
         assert_eq!(options, vec![DownloadProvider::Mlx]);
+    }
+
+    // ── start_download regression tests ─────────────────────────────────
+
+    #[test]
+    fn start_download_skips_already_installed_model_even_when_fit_flag_is_stale() {
+        let mut app = test_app();
+        app.ollama_available = true;
+        let mut fit = test_fit("test/llama-3.1-8b", FitLevel::Perfect, 90.0);
+        fit.installed = false;
+        app.all_fits = vec![fit];
+        app.filtered_fits = vec![0];
+        app.selected_row = 0;
+        app.installed.ollama.insert("test/llama-3.1-8b".to_string());
+
+        app.start_download();
+
+        assert_eq!(app.pull_status, Some("Already installed".to_string()));
+    }
+
+    #[test]
+    fn start_download_gguf_message_when_sources_exist_but_no_provider_matches() {
+        let mut app = test_app();
+        app.ollama_available = true;
+        app.ollama_binary_available = false;
+        app.mlx_available = false;
+        app.llamacpp_available = false;
+        app.docker_mr_available = false;
+        app.lmstudio_available = false;
+        app.vllm_available = false;
+
+        let model = LlmModel {
+            name: "some/unknown-model".to_string(),
+            gguf_sources: vec![GgufSource {
+                repo: "user/unknown-model-GGUF".to_string(),
+                provider: "user".to_string(),
+            }],
+            ..test_model("some/unknown-model")
+        };
+        let fit = ModelFit {
+            model: model.clone(),
+            installed: false,
+            ..test_fit("some/unknown-model", FitLevel::Good, 80.0)
+        };
+        app.all_fits = vec![fit];
+        app.filtered_fits = vec![0];
+        app.selected_row = 0;
+
+        app.start_download();
+
+        assert_eq!(
+            app.pull_status,
+            Some("GGUF sources available — install llama.cpp or LM Studio to download".to_string())
+        );
     }
 
     #[test]
