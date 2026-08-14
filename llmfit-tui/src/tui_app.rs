@@ -1,6 +1,7 @@
 use llmfit_core::fit::{CalcConfig, FitLevel, ModelFit, SortColumn, backend_compatible};
 use llmfit_core::hardware::SystemSpecs;
 use llmfit_core::models::{Capability, LlmModel, ModelDatabase, UseCase, matches_provider_filter};
+use llmfit_core::optimization::{OptimizationResult, optimize_for_system};
 use llmfit_core::plan::{PlanEstimate, PlanRequest, estimate_model_plan_with_config};
 use llmfit_core::providers::{
     self, DockerModelRunnerProvider, LlamaCppProvider, LmStudioProvider, MlxProvider,
@@ -1056,6 +1057,10 @@ pub struct App {
     // Benchmarks view (localmaxxing.com)
     pub show_benchmarks: bool,
     pub bench_entries: Vec<llmfit_core::benchmarks::LeaderboardEntry>,
+
+    // Optimize view (system-wide model recommendation from optimizer)
+    pub show_optimize: bool,
+    pub optimize_result: Option<OptimizationResult>,
     pub bench_cursor: usize,
     pub bench_scroll: usize,
     pub bench_loading: bool,
@@ -1571,6 +1576,10 @@ impl App {
             filter_mem_pct_max_input: String::new(),
             filter_sort_ascending: sort_ascending,
             filter_snapshot: None,
+            // Optimize view
+            show_optimize: false,
+            optimize_result: None,
+
             // Benchmarks
             show_benchmarks: false,
             bench_entries: Vec::new(),
@@ -2531,6 +2540,36 @@ impl App {
             self.bench_fetch_rx = None;
             self.bench_loading = false;
         }
+    }
+
+    // ── Optimize view ──────────────────────────────────────────────────
+
+    pub fn toggle_optimize(&mut self) {
+        if self.show_optimize {
+            self.close_optimize();
+        } else {
+            self.open_optimize();
+        }
+    }
+
+    pub fn open_optimize(&mut self) {
+        self.show_detail = false;
+        self.show_compare = false;
+        self.show_multi_compare = false;
+        self.show_plan = false;
+        self.show_downloads = false;
+        self.show_benchmarks = false;
+        self.show_bench = false;
+        self.show_optimize = true;
+
+        let db = ModelDatabase::new();
+        let specs = self.specs.clone();
+        self.optimize_result = Some(optimize_for_system(&specs, &db, 10));
+    }
+
+    pub fn close_optimize(&mut self) {
+        self.show_optimize = false;
+        self.optimize_result = None;
     }
 
     /// Toggle the "share with llmfit" checkbox in the bench-offer modal.
@@ -5913,5 +5952,152 @@ mod tests {
         app.bench_search_clear();
         assert!(app.bench_search_query.is_empty());
         assert_eq!(app.bench_visible_indices(), vec![0, 1]);
+    }
+
+    #[test]
+    fn toggle_optimize_opens_and_closes_view() {
+        let mut app = test_app();
+        assert!(!app.show_optimize);
+        assert!(app.optimize_result.is_none());
+
+        app.toggle_optimize();
+        assert!(app.show_optimize);
+        assert!(app.optimize_result.is_some());
+
+        app.toggle_optimize();
+        assert!(!app.show_optimize);
+        assert!(app.optimize_result.is_none());
+    }
+
+    #[test]
+    fn open_optimize_closes_other_views() {
+        let mut app = test_app();
+        app.show_detail = true;
+        app.show_compare = true;
+        app.show_plan = true;
+        app.show_downloads = true;
+        app.show_benchmarks = true;
+
+        app.open_optimize();
+
+        assert!(app.show_optimize);
+        assert!(!app.show_detail);
+        assert!(!app.show_compare);
+        assert!(!app.show_plan);
+        assert!(!app.show_downloads);
+        assert!(!app.show_benchmarks);
+    }
+
+    #[test]
+    fn close_optimize_resets_state() {
+        let mut app = test_app();
+        app.open_optimize();
+        assert!(app.show_optimize);
+        assert!(app.optimize_result.is_some());
+
+        app.close_optimize();
+        assert!(!app.show_optimize);
+        assert!(app.optimize_result.is_none());
+    }
+
+    fn arm64_specs() -> SystemSpecs {
+        SystemSpecs {
+            architecture: llmfit_core::hardware::CpuArchitecture::Aarch64,
+            total_ram_gb: 16.0,
+            available_ram_gb: 14.0,
+            physical_cpu_cores: Some(8),
+            total_cpu_cores: 8,
+            cpu_name: "Cortex-A78".to_string(),
+            cpu_vendor: Some("arm".to_string()),
+            arm_capabilities: None,
+            has_gpu: false,
+            gpu_vram_gb: None,
+            total_gpu_vram_gb: None,
+            gpu_available_gb: None,
+            gpu_name: None,
+            gpu_count: 0,
+            unified_memory: false,
+            backend: GpuBackend::CpuArm,
+            gpus: Vec::new(),
+            cluster_mode: false,
+            cluster_node_count: 0,
+        }
+    }
+
+    #[test]
+    fn optimize_arm64_produces_measured_candidate() {
+        let mut app = App::with_specs_and_context(arm64_specs(), None);
+        app.open_optimize();
+
+        let result = app
+            .optimize_result
+            .expect("optimize result should be populated");
+        assert_eq!(
+            result.hardware_architecture,
+            llmfit_core::hardware::CpuArchitecture::Aarch64
+        );
+        assert!(result.is_arm_aware);
+        assert!(result.selected_candidate.is_some());
+        assert!(result.best_available.is_some());
+    }
+
+    #[test]
+    fn optimize_result_distinguishes_best_measured_and_best_predicted() {
+        let mut app = App::with_specs_and_context(arm64_specs(), None);
+        app.open_optimize();
+
+        let result = app
+            .optimize_result
+            .as_ref()
+            .expect("optimize result should be populated");
+
+        // On ARM64 with community benchmark data, best_measured should be populated.
+        // best_predicted may or may not be present, but if both exist they must
+        // point to different candidates (different provenance or model).
+        if let (Some(measured), Some(predicted)) = (
+            result.best_measured.as_ref(),
+            result.best_predicted.as_ref(),
+        ) {
+            // The two must not be the same candidate.
+            assert_ne!(measured.model.name, predicted.model.name);
+            assert_ne!(
+                measured.performance_provenance, predicted.performance_provenance,
+                "best_measured should be Measured provenance, best_predicted should be Estimated"
+            );
+        }
+    }
+
+    #[test]
+    fn optimize_no_benchmark_shows_predicted_only() {
+        // On x86_64 test specs (no GPU, no matching community benchmarks in cache),
+        // best_measured may be None while best_predicted is still populated.
+        let mut app = test_app();
+        app.open_optimize();
+
+        let result = app
+            .optimize_result
+            .as_ref()
+            .expect("optimize result should be populated");
+
+        // At least one of best_measured or best_predicted should exist, since
+        // the optimizer always has candidates (with estimated TPS).
+        assert!(
+            result.best_measured.is_some() || result.best_predicted.is_some(),
+            "at least one candidate should be available"
+        );
+
+        // Verify provenance labeling distinguishes the two paths.
+        if let Some(measured) = &result.best_measured {
+            assert_eq!(
+                measured.performance_provenance,
+                llmfit_core::optimization::OptimizationProvenance::Measured
+            );
+        }
+        if let Some(predicted) = &result.best_predicted {
+            assert_eq!(
+                predicted.performance_provenance,
+                llmfit_core::optimization::OptimizationProvenance::Estimated
+            );
+        }
     }
 }

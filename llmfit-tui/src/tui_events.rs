@@ -87,6 +87,8 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
                 app.show_detail = false;
             } else if app.show_compare {
                 app.show_compare = false;
+            } else if app.show_optimize {
+                app.close_optimize();
             } else {
                 app.save_filters();
                 app.should_quit = true;
@@ -233,6 +235,9 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
         KeyCode::Char('c') => app.toggle_compare_view(),
         KeyCode::Char('x') => app.clear_compare_mark(),
         KeyCode::Char('y') => app.copy_selected_model_name(),
+
+        // Optimize view
+        KeyCode::Char('o') => app.toggle_optimize(),
 
         _ => {}
     }
