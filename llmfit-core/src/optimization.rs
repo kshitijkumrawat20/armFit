@@ -143,9 +143,27 @@ pub fn optimize_for_system(
     db: &ModelDatabase,
     limit: usize,
 ) -> OptimizationResult {
+    let local_index = crate::share::LocalBenchIndex::load(specs);
+    let community_index = crate::benchmarks::CommunityBenchIndex::for_specs(specs);
+    let measured_index = crate::benchmarks::MeasuredTpsIndex::for_specs(specs);
+
     let mut candidates = Vec::new();
     for model in db.get_all_models() {
-        let fit = ModelFit::analyze_with_context_limit(model, specs, None);
+        let mut fit = ModelFit::analyze_with_context_limit(model, specs, None);
+        fit.measured_tps = local_index
+            .as_ref()
+            .and_then(|idx| idx.lookup(&model.name))
+            .or_else(|| {
+                community_index
+                    .as_ref()
+                    .and_then(|idx| idx.lookup(&model.name))
+            })
+            .or_else(|| {
+                measured_index
+                    .as_ref()
+                    .and_then(|idx| idx.lookup(&model.name, &fit.best_quant))
+            });
+
         if fit.fit_level == FitLevel::TooTight && fit.estimated_tps <= 0.0 {
             continue;
         }
@@ -745,5 +763,133 @@ mod tests {
                 || result.best_predicted.is_some()
                 || result.best_available.is_some()
         );
+    }
+
+    #[test]
+    fn optimize_for_system_attaches_local_arm64_benchmark_evidence() {
+        use serde_json::json;
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "llmfit-arm-benchmark-fix-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let pending_dir = temp_dir.join("pending");
+        std::fs::create_dir_all(&pending_dir).unwrap();
+        unsafe {
+            std::env::set_var("LLMFIT_BENCH_STORE", &temp_dir);
+        }
+
+        let payload = json!({
+            "schemaVersion": 2,
+            "hardware": {
+                "hwClass": "CPU_ONLY",
+                "hardwareName": null,
+                "cpu": "Neoverse-N1",
+                "cpuVendor": "ARM",
+                "cpuArchitecture": "aarch64",
+                "ramGb": 3.74,
+                "os": "linux"
+            },
+            "results": [{
+                "model": "qwen2.5:1.5b",
+                "provider": "ollama",
+                "numRuns": 3,
+                "avgTps": 16.82,
+                "minTps": 15.1,
+                "maxTps": 18.3,
+                "avgTtftMs": 574.0,
+                "avgTotalMs": 1024.0,
+                "avgOutputTokens": 128.0,
+                "avgPromptTokens": 24.0
+            }]
+        });
+
+        std::fs::write(
+            pending_dir.join("1700000000-aws-arm-bench.json"),
+            serde_json::to_string_pretty(&payload).unwrap(),
+        )
+        .unwrap();
+
+        let specs = SystemSpecs {
+            architecture: CpuArchitecture::Aarch64,
+            total_ram_gb: 3.74,
+            available_ram_gb: 3.74,
+            physical_cpu_cores: Some(2),
+            total_cpu_cores: 2,
+            cpu_name: "Neoverse-N1".to_string(),
+            cpu_vendor: Some("ARM".to_string()),
+            arm_capabilities: None,
+            has_gpu: false,
+            gpu_vram_gb: None,
+            total_gpu_vram_gb: None,
+            gpu_available_gb: None,
+            gpu_name: None,
+            gpu_count: 0,
+            unified_memory: false,
+            backend: GpuBackend::CpuArm,
+            gpus: vec![],
+            cluster_mode: false,
+            cluster_node_count: 0,
+        };
+
+        let db = ModelDatabase::new();
+        let model = db
+            .get_all_models()
+            .iter()
+            .find(|m| m.name == "Qwen/Qwen2.5-1.5B")
+            .expect("Qwen2.5 1.5B should be present in the catalog");
+
+        let _fit = ModelFit::analyze_with_context_limit(model, &specs, None);
+        let with_measurement = crate::share::LocalBenchIndex::load(&specs)
+            .and_then(|idx| idx.lookup(&model.name))
+            .expect("pending AWS benchmark should attach to the matching model");
+        assert_eq!(
+            with_measurement.source,
+            crate::benchmarks::MeasuredSource::LocalBench
+        );
+        assert!((with_measurement.tok_s - 16.82).abs() < 1.0);
+
+        let result = optimize_for_system(&specs, &db, 10);
+        let measured = result
+            .best_measured
+            .expect("best_measured should be populated");
+        assert_eq!(measured.model.name, "Qwen/Qwen2.5-1.5B");
+        assert_eq!(measured.runtime, InferenceRuntime::LlamaCpp);
+        assert_ne!(measured.benchmark_match_level, HardwareMatchLevel::NoMatch);
+        assert_eq!(
+            measured.performance_provenance,
+            OptimizationProvenance::Measured
+        );
+        assert!(measured.measured_tps.is_some());
+        assert!((measured.measured_tps.unwrap() - 16.82).abs() < 1.0);
+        assert!(result.best_predicted.is_some());
+        assert_ne!(
+            measured.model.name,
+            result.best_predicted.unwrap().model.name
+        );
+
+        let x86_specs = specs_for_arch(CpuArchitecture::X86_64);
+        let x86_result = optimize_for_system(&x86_specs, &db, 10);
+        let x86_measured = x86_result
+            .best_measured
+            .map(|c| c.model.name)
+            .unwrap_or_else(|| {
+                x86_result
+                    .best_predicted
+                    .as_ref()
+                    .map(|c| c.model.name.clone())
+                    .unwrap_or_default()
+            });
+        assert_ne!(x86_measured, "Qwen/Qwen2.5-1.5B");
+
+        unsafe {
+            std::env::remove_var("LLMFIT_BENCH_STORE");
+        }
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

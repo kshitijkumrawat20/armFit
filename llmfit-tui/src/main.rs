@@ -1196,7 +1196,7 @@ fn find_name_index_by_selector<T>(
     let lower = needle.to_lowercase();
     if let Some((idx, _)) = items.iter().enumerate().find(|(_, item)| {
         let name = get_name(item);
-        name.to_lowercase() == lower || llmfit_core::providers::tag_matches_model(needle, name)
+        name.to_lowercase() == lower
     }) {
         return Ok(idx);
     }

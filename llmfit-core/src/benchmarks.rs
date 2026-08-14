@@ -567,8 +567,7 @@ pub enum HardwareMatchLevel {
 pub fn evaluate_hardware_match(hw: &serde_json::Value, specs: &SystemSpecs) -> HardwareMatchLevel {
     let hw_cpu = hw["cpu"].as_str();
     let hw_gpu = hw["hardwareName"].as_str();
-    let cpu_exact = hw_cpu
-        .is_some_and(|c| c.eq_ignore_ascii_case(&specs.cpu_name));
+    let cpu_exact = hw_cpu.is_some_and(|c| c.eq_ignore_ascii_case(&specs.cpu_name));
     let gpu_exact = match (&specs.gpu_name, hw_gpu) {
         (Some(now), Some(then)) => now.eq_ignore_ascii_case(then),
         (None, None) => true,
@@ -579,17 +578,18 @@ pub fn evaluate_hardware_match(hw: &serde_json::Value, specs: &SystemSpecs) -> H
         .as_str()
         .map(crate::hardware::CpuArchitecture::from_arch_str);
 
-    let arch_matches = match hw_arch {
-        Some(hw_arch) => hw_arch == specs.architecture,
-        None => {
-            // Legacy submissions may omit the architecture field. On ARM64 we
-            // keep the old safety net, but only when the rest of the hardware
-            // identity aligns.
-            specs.architecture == crate::hardware::CpuArchitecture::Aarch64
-        }
-    };
+    // Legacy payloads may omit `cpuArchitecture`. Preserve the historical
+    // exact-match behavior for those submissions when both the CPU and GPU
+    // identifiers still match exactly; otherwise reject them.
+    if hw_arch.is_none() {
+        return if cpu_exact && gpu_exact {
+            HardwareMatchLevel::Exact
+        } else {
+            HardwareMatchLevel::NoMatch
+        };
+    }
 
-    if !arch_matches {
+    if hw_arch != Some(specs.architecture) {
         return HardwareMatchLevel::NoMatch;
     }
 
@@ -597,19 +597,19 @@ pub fn evaluate_hardware_match(hw: &serde_json::Value, specs: &SystemSpecs) -> H
         return HardwareMatchLevel::Exact;
     }
 
-    if specs.architecture == crate::hardware::CpuArchitecture::Aarch64 && gpu_exact {
-        // ARM64 CPU strings are not stable across vendors or OS reports
-        // (`Neoverse-N1`, `Cortex-A72`, `Amazon Graviton3`, ...). If the same
-        // architecture and GPU/CPU-only bucket still align, treat it as a
-        // valid high-confidence local benchmark rather than rejecting it.
+    if gpu_exact
+        && matches!(
+            specs.architecture,
+            crate::hardware::CpuArchitecture::Aarch64 | crate::hardware::CpuArchitecture::X86_64
+        )
+    {
+        // Historical x86_64 submissions and ARM64 hardware with stable
+        // architecture metadata can still be valid when the GPU bucket aligns,
+        // even if an OEM reports a slightly different CPU string.
         return HardwareMatchLevel::HighConfidence;
     }
 
-    if !cpu_exact || !gpu_exact {
-        return HardwareMatchLevel::NoMatch;
-    }
-
-    HardwareMatchLevel::HighConfidence
+    HardwareMatchLevel::NoMatch
 }
 
 pub fn hardware_payload_matches(hw: &serde_json::Value, specs: &SystemSpecs) -> bool {
