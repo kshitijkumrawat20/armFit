@@ -32,7 +32,7 @@ const UPSTREAM_OWNER: &str = "AlexsJones";
 const UPSTREAM_REPO: &str = "llmfit";
 const UPSTREAM_BRANCH: &str = "main";
 const SUBMISSION_DIR: &str = "llmfit-core/data/community";
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 const USER_AGENT: &str = concat!("llmfit/", env!("CARGO_PKG_VERSION"));
 const API: &str = "https://api.github.com";
 
@@ -84,6 +84,14 @@ struct HwPayload {
     cpu_cores: usize,
     ram_gb: f64,
     os: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cpu_architecture: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cpu_vendor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cpu_cores_physical: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    arm_capabilities: Option<crate::hardware::ArmCapabilities>,
 }
 
 #[derive(Serialize)]
@@ -98,6 +106,16 @@ struct ResultPayload {
     avg_ttft_ms: Option<f64>,
     avg_total_ms: f64,
     avg_output_tokens: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    avg_prompt_tokens: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runtime_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quantization: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_length: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    batch_size: Option<u32>,
 }
 
 fn os_name() -> &'static str {
@@ -172,6 +190,11 @@ fn build_submission(results: &[BenchResult], specs: &SystemSpecs) -> Submission 
             avg_ttft_ms: r.summary.avg_ttft_ms.map(round2),
             avg_total_ms: round2(r.summary.avg_total_ms),
             avg_output_tokens: round2(r.summary.avg_output_tokens),
+            avg_prompt_tokens: Some(round2(r.summary.avg_prompt_tokens)),
+            runtime_version: None,
+            quantization: None,
+            context_length: None,
+            batch_size: None,
         })
         .collect();
 
@@ -193,6 +216,14 @@ fn build_submission(results: &[BenchResult], specs: &SystemSpecs) -> Submission 
             cpu_cores: specs.total_cpu_cores,
             ram_gb: round2(specs.total_ram_gb),
             os: os_name(),
+            cpu_architecture: match specs.architecture {
+                crate::hardware::CpuArchitecture::Aarch64 => Some("aarch64".to_string()),
+                crate::hardware::CpuArchitecture::X86_64 => Some("x86_64".to_string()),
+                crate::hardware::CpuArchitecture::Unknown => None,
+            },
+            cpu_vendor: specs.cpu_vendor.clone(),
+            cpu_cores_physical: specs.physical_cpu_cores,
+            arm_capabilities: specs.arm_capabilities.clone(),
         },
         results,
     }
@@ -278,6 +309,22 @@ fn short_hash(s: &str) -> String {
 // Local benchmark store
 // ---------------------------------------------------------------------------
 
+fn result_entries_for_payload<'a>(payload: &'a Value) -> Vec<&'a Value> {
+    if let Some(results) = payload.get("results").and_then(Value::as_array) {
+        return results.iter().collect();
+    }
+
+    let legacy_present = payload.get("model").is_some()
+        || payload.get("provider").is_some()
+        || payload.get("avgTps").is_some()
+        || payload.get("avgTtftMs").is_some()
+        || payload.get("result").is_some();
+    if legacy_present {
+        return vec![payload];
+    }
+    Vec::new()
+}
+
 /// A submission payload recorded in the local benchmark store.
 #[derive(Clone)]
 pub struct StoredBenchmark {
@@ -295,17 +342,20 @@ impl StoredBenchmark {
 
     /// One line per benchmark result: `model via provider — N tok/s`.
     pub fn result_lines(&self) -> Vec<String> {
-        let Some(results) = self.payload["results"].as_array() else {
-            return Vec::new();
-        };
-        results
-            .iter()
+        result_entries_for_payload(&self.payload)
+            .into_iter()
             .map(|r| {
                 format!(
                     "{} via {} — {:.1} tok/s",
-                    r["model"].as_str().unwrap_or("?"),
-                    r["provider"].as_str().unwrap_or("?"),
-                    r["avgTps"].as_f64().unwrap_or(0.0),
+                    r["model"]
+                        .as_str()
+                        .unwrap_or_else(|| r["result"]["model"].as_str().unwrap_or("?")),
+                    r["provider"]
+                        .as_str()
+                        .unwrap_or_else(|| r["result"]["provider"].as_str().unwrap_or("?")),
+                    r["avgTps"]
+                        .as_f64()
+                        .unwrap_or_else(|| r["result"]["avgTps"].as_f64().unwrap_or(0.0)),
                 )
             })
             .collect()
@@ -441,8 +491,8 @@ pub fn mark_shared(stored: &[StoredBenchmark]) {
 /// annotate fit rows: a throughput measured on THIS machine is ground truth
 /// and takes priority over community medians and formula estimates.
 pub struct LocalBenchIndex {
-    /// (provider model tag, tok/s), newest run first.
-    entries: Vec<(String, f64)>,
+    /// (provider model tag, tok/s, match_level), newest run first.
+    entries: Vec<(String, f64, crate::benchmarks::HardwareMatchLevel)>,
 }
 
 impl LocalBenchIndex {
@@ -450,19 +500,24 @@ impl LocalBenchIndex {
     /// `specs`. Returns `None` when nothing qualifies so callers can skip
     /// per-model lookups entirely.
     pub fn load(specs: &SystemSpecs) -> Option<Self> {
-        let mut entries: Vec<(String, f64)> = Vec::new();
+        let mut entries: Vec<(String, f64, crate::benchmarks::HardwareMatchLevel)> = Vec::new();
         for s in shared_benchmarks().into_iter().chain(pending_benchmarks()) {
-            if !s.matches_hardware(specs) {
+            let match_level =
+                crate::benchmarks::evaluate_hardware_match(&s.payload["hardware"], specs);
+            if match_level == crate::benchmarks::HardwareMatchLevel::NoMatch {
                 continue;
             }
-            let Some(results) = s.payload["results"].as_array() else {
-                continue;
-            };
-            for r in results {
-                if let (Some(model), Some(tps)) = (r["model"].as_str(), r["avgTps"].as_f64())
+            for r in result_entries_for_payload(&s.payload) {
+                let model = r["model"]
+                    .as_str()
+                    .or_else(|| r["result"]["model"].as_str());
+                let tps = r["avgTps"]
+                    .as_f64()
+                    .or_else(|| r["result"]["avgTps"].as_f64());
+                if let (Some(model), Some(tps)) = (model, tps)
                     && tps > 0.0
                 {
-                    entries.push((model.to_string(), tps));
+                    entries.push((model.to_string(), tps, match_level));
                 }
             }
         }
@@ -474,17 +529,19 @@ impl LocalBenchIndex {
     /// Most recent locally measured tok/s for a catalog model, if any stored
     /// run's provider tag matches it.
     pub fn lookup(&self, model_hf_name: &str) -> Option<crate::benchmarks::MeasuredTps> {
-        let matches: Vec<f64> = self
+        let matches: Vec<(f64, crate::benchmarks::HardwareMatchLevel)> = self
             .entries
             .iter()
-            .filter(|(tag, _)| crate::providers::tag_matches_model(tag, model_hf_name))
-            .map(|(_, tps)| *tps)
+            .filter(|(tag, _, _)| crate::providers::tag_matches_model(tag, model_hf_name))
+            .map(|(_, tps, ml)| (*tps, *ml))
             .collect();
+        let first_match = matches.first()?;
         Some(crate::benchmarks::MeasuredTps {
-            tok_s: *matches.first()?,
+            tok_s: first_match.0,
             sample_count: matches.len() as u32,
             hardware_label: "this machine".to_string(),
             source: crate::benchmarks::MeasuredSource::LocalBench,
+            match_level: first_match.1,
         })
     }
 }
@@ -1252,10 +1309,14 @@ mod tests {
 
     fn specs_with_gpu(name: &str) -> SystemSpecs {
         SystemSpecs {
+            architecture: crate::hardware::CpuArchitecture::X86_64,
             total_ram_gb: 32.0,
             available_ram_gb: 24.0,
+            physical_cpu_cores: Some(8),
             total_cpu_cores: 8,
             cpu_name: "Test CPU".to_string(),
+            cpu_vendor: None,
+            arm_capabilities: None,
             has_gpu: true,
             gpu_vram_gb: Some(24.0),
             total_gpu_vram_gb: Some(24.0),
@@ -1292,6 +1353,7 @@ mod tests {
                 max_tps: 133.7,
                 avg_total_ms: 812.5,
                 avg_output_tokens: 104.0,
+                avg_prompt_tokens: 16.0,
             },
         }
     }
@@ -1380,7 +1442,7 @@ mod tests {
 
         let pending = pending_benchmarks();
         assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].payload["schemaVersion"], 1);
+        assert_eq!(pending[0].payload["schemaVersion"], 2);
         assert_eq!(
             pending[0].result_lines(),
             vec!["llama3.1:8b via ollama — 128.4 tok/s".to_string()]
@@ -1438,6 +1500,64 @@ mod tests {
     }
 
     #[test]
+    fn schema_v2_results_array_is_consumed_for_local_bench_index() {
+        let _specs = specs_with_gpu("NVIDIA GeForce RTX 4090");
+        let payload = serde_json::json!({
+            "schemaVersion": 2,
+            "hardware": {
+                "hwClass": "DISCRETE_GPU",
+                "hardwareName": "NVIDIA GeForce RTX 4090",
+                "cpu": "Intel(R) Core(TM) i9-14900K",
+                "cpuArchitecture": "x86_64",
+                "ramGb": 64.0,
+                "os": "linux"
+            },
+            "results": [
+                { "model": "llama3.1:8b", "provider": "ollama", "avgTps": 128.44 },
+                { "model": "qwen2.5:7b", "provider": "ollama", "avgTps": 89.25 }
+            ]
+        });
+        let mut entries = Vec::new();
+        for r in result_entries_for_payload(&payload) {
+            let model = r["model"].as_str().unwrap();
+            let tps = r["avgTps"].as_f64().unwrap();
+            entries.push((
+                model.to_string(),
+                tps,
+                crate::benchmarks::HardwareMatchLevel::Exact,
+            ));
+        }
+        let idx = LocalBenchIndex { entries };
+        assert!(idx.lookup("test/llama-3.1-8b").is_some());
+        assert!(idx.lookup("test/qwen2.5-7b").is_some());
+    }
+
+    #[test]
+    fn schema_v1_legacy_top_level_result_still_loads() {
+        use crate::benchmarks::evaluate_hardware_match;
+        let specs = specs_with_gpu("NVIDIA GeForce RTX 4090");
+        let payload = serde_json::json!({
+            "schemaVersion": 1,
+            "hardware": {
+                "hwClass": "DISCRETE_GPU",
+                "hardwareName": "NVIDIA GeForce RTX 4090",
+                "cpu": "Intel(R) Core(TM) i9-14900K",
+                "cpuArchitecture": "x86_64",
+                "ramGb": 64.0,
+                "os": "linux"
+            },
+            "model": "llama3.1:8b",
+            "provider": "ollama",
+            "avgTps": 42.0
+        });
+        assert_eq!(result_entries_for_payload(&payload).len(), 1);
+        assert!(
+            evaluate_hardware_match(&payload["hardware"], &specs)
+                != crate::benchmarks::HardwareMatchLevel::NoMatch
+        );
+    }
+
+    #[test]
     fn short_hash_is_hex() {
         let h = short_hash("{\"a\":1}");
         assert_eq!(h.len(), 8);
@@ -1460,6 +1580,7 @@ mod tests {
                 max_tps: 133.7,
                 avg_total_ms: 812.5,
                 avg_output_tokens: 104.0,
+                avg_prompt_tokens: 16.0,
             },
         };
         // llama-server results are labeled "llamacpp" — must be schema-valid too.
@@ -1475,6 +1596,7 @@ mod tests {
                 max_tps: 45.0,
                 avg_total_ms: 2400.0,
                 avg_output_tokens: 100.0,
+                avg_prompt_tokens: 0.0,
             },
         };
 
@@ -1502,7 +1624,7 @@ mod tests {
         );
 
         // camelCase field names must survive serialization.
-        assert_eq!(value["schemaVersion"], 1);
+        assert_eq!(value["schemaVersion"].as_u64().unwrap(), 2);
         assert_eq!(value["hardware"]["hwClass"], "DISCRETE_GPU");
         assert_eq!(value["hardware"]["memTierGb"], 24);
         assert_eq!(value["results"][0]["avgTps"], 128.44);

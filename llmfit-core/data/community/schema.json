@@ -6,7 +6,7 @@
   "additionalProperties": false,
   "required": ["schemaVersion", "submittedAtUnix", "tool", "hardware", "results"],
   "properties": {
-    "schemaVersion": { "type": "integer", "const": 1 },
+    "schemaVersion": { "type": "integer", "enum": [1, 2] },
     "submittedAtUnix": { "type": "integer", "minimum": 0 },
     "tool": {
       "type": "object",
@@ -31,7 +31,21 @@
         "cpu": { "type": "string" },
         "cpuCores": { "type": "integer", "minimum": 1 },
         "ramGb": { "type": "number", "minimum": 0 },
-        "os": { "type": "string", "enum": ["linux", "macos", "windows"] }
+        "os": { "type": "string", "enum": ["linux", "macos", "windows"] },
+        "cpuArchitecture": { "type": "string" },
+        "cpuVendor": { "type": "string" },
+        "cpuCoresPhysical": { "type": "integer", "minimum": 1 },
+        "armCapabilities": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["dotprod", "i8mm", "sve", "sme"],
+          "properties": {
+            "dotprod": { "type": "boolean" },
+            "i8mm": { "type": "boolean" },
+            "sve": { "type": "boolean" },
+            "sme": { "type": "boolean" }
+          }
+        }
       }
     },
     "results": {
@@ -50,7 +64,12 @@
           "maxTps": { "type": "number", "minimum": 0, "maximum": 100000 },
           "avgTtftMs": { "type": ["number", "null"], "minimum": 0 },
           "avgTotalMs": { "type": "number", "minimum": 0 },
-          "avgOutputTokens": { "type": "number", "minimum": 0 }
+          "avgOutputTokens": { "type": "number", "minimum": 0 },
+          "avgPromptTokens": { "type": ["number", "null"], "minimum": 0 },
+          "runtimeVersion": { "type": ["string", "null"] },
+          "quantization": { "type": ["string", "null"] },
+          "contextLength": { "type": ["integer", "null"] },
+          "batchSize": { "type": ["integer", "null"] }
         }
       }
     }

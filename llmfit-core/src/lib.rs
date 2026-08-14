@@ -6,6 +6,7 @@ pub mod doctor;
 pub mod fit;
 pub mod hardware;
 pub mod models;
+pub mod optimization;
 pub mod plan;
 pub mod providers;
 pub mod quality;
@@ -14,9 +15,19 @@ pub mod task_bench;
 pub mod update;
 
 pub use analysis::{InstalledIndex, build_model_fits};
-pub use fit::{FitLevel, InferenceRuntime, ModelFit, RunMode, ScoreComponents, SortColumn};
-pub use hardware::{GpuBackend, SystemSpecs};
+pub use fit::{
+    ArmArchitectureCompatibility, ArmBenchmarkEvidence, ArmMemoryStatus, ArmPerformanceProvenance,
+    ArmRecommendation, ArmRuntimeStatus, FitLevel, InferenceRuntime, ModelFit, RunMode,
+    ScoreComponents, SortColumn,
+};
+pub use hardware::{
+    ArmCapabilities, ArmCapabilityStatus, CpuArchitecture, GpuBackend, SystemSpecs,
+};
 pub use models::{Capability, LlmModel, ModelDatabase, ModelFormat, UseCase};
+pub use optimization::{
+    ArmValidationStatus, OptimizationCandidate, OptimizationProvenance, OptimizationResult,
+    RuntimeAvailability, explain_candidate, optimize_for_system,
+};
 pub use plan::{
     HardwareEstimate, PathEstimate, PlanCurrentStatus, PlanEstimate, PlanRequest, PlanRunPath,
     UpgradeDelta, estimate_model_plan, estimate_model_plan_with_config, normalize_quant,

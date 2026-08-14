@@ -87,6 +87,8 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
                 app.show_detail = false;
             } else if app.show_compare {
                 app.show_compare = false;
+            } else if app.show_optimize {
+                app.close_optimize();
             } else {
                 app.save_filters();
                 app.should_quit = true;
@@ -233,6 +235,9 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
         KeyCode::Char('c') => app.toggle_compare_view(),
         KeyCode::Char('x') => app.clear_compare_mark(),
         KeyCode::Char('y') => app.copy_selected_model_name(),
+
+        // Optimize view
+        KeyCode::Char('o') => app.toggle_optimize(),
 
         _ => {}
     }
@@ -793,10 +798,14 @@ mod tests {
     fn plan_mode_app() -> App {
         let mut app = App::with_specs_and_context(
             SystemSpecs {
+                architecture: llmfit_core::hardware::CpuArchitecture::X86_64,
                 total_ram_gb: 16.0,
                 available_ram_gb: 12.0,
+                physical_cpu_cores: Some(8),
                 total_cpu_cores: 8,
                 cpu_name: "Test CPU".to_string(),
+                cpu_vendor: None,
+                arm_capabilities: None,
                 has_gpu: false,
                 gpu_vram_gb: None,
                 total_gpu_vram_gb: None,

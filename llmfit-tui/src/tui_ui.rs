@@ -17,10 +17,12 @@ use crate::tui_app::{
     DownloadProvider, FitFilter, InputMode, PlanField, SimulationField, matched_gguf_provider,
     provider_selected,
 };
+use llmfit_core::benchmarks::{HardwareMatchLevel, MeasuredSource};
 use llmfit_core::fit::{FitLevel, ModelFit, SortColumn};
 use llmfit_core::hardware::is_running_in_wsl;
+use llmfit_core::optimization::{OptimizationProvenance, RuntimeAvailability};
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const DM_MODELS_DIR_LABEL: &str = "  Models dir:  ";
 
@@ -58,6 +60,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_multi_compare(frame, app, outer[2], &tc);
     } else if app.show_compare {
         draw_compare(frame, app, outer[2], &tc);
+    } else if app.show_optimize {
+        draw_optimize(frame, app, outer[2], &tc);
     } else if app.show_detail {
         draw_detail(frame, app, outer[2], &tc);
     } else {
@@ -1786,6 +1790,345 @@ fn truncate_str(s: &str, max_len: usize) -> String {
     }
 }
 
+fn provenance_label(p: OptimizationProvenance) -> &'static str {
+    match p {
+        OptimizationProvenance::Measured => "MEASURED",
+        OptimizationProvenance::Estimated => "ESTIMATED",
+        OptimizationProvenance::Unavailable => "UNAVAILABLE",
+    }
+}
+
+fn match_level_label(m: HardwareMatchLevel) -> &'static str {
+    match m {
+        HardwareMatchLevel::Exact => "Exact",
+        HardwareMatchLevel::HighConfidence => "High confidence",
+        HardwareMatchLevel::Partial => "Partial",
+        HardwareMatchLevel::NoMatch => "No match",
+    }
+}
+
+fn runtime_avail_label(r: RuntimeAvailability) -> &'static str {
+    match r {
+        RuntimeAvailability::Unknown => "unknown",
+        RuntimeAvailability::Unavailable => "unavailable",
+        RuntimeAvailability::Installed => "installed",
+        RuntimeAvailability::Benchmarkable => "benchmarkable",
+        RuntimeAvailability::Benchmarked => "benchmarked",
+    }
+}
+
+fn measured_source_label(s: MeasuredSource) -> &'static str {
+    match s {
+        MeasuredSource::Community => "community",
+        MeasuredSource::CommunityLlmfit => "community (llmfit)",
+        MeasuredSource::LocalBench => "local bench",
+    }
+}
+
+fn draw_optimize(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
+    let result = match &app.optimize_result {
+        Some(r) => r,
+        None => {
+            let block = Block::default().borders(Borders::ALL).title(" Optimize ");
+            frame.render_widget(block, area);
+            return;
+        }
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(tc.border))
+        .title(" Optimize ")
+        .title_style(Style::default().fg(tc.accent_secondary).bold());
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(4),
+            Constraint::Min(10),
+            Constraint::Min(2),
+        ])
+        .split(inner);
+
+    let arch_label = result.hardware_architecture.label();
+    let header_lines = vec![
+        Line::from(vec![
+            Span::styled(arch_label, Style::default().fg(tc.fg).bold()),
+            Span::styled("  │  ", Style::default().fg(tc.muted)),
+            Span::styled("Ollama: ", Style::default().fg(tc.muted)),
+            Span::styled(
+                if app.ollama_available {
+                    "✓ available"
+                } else {
+                    "✗ not detected"
+                },
+                Style::default().fg(if app.ollama_available {
+                    tc.good
+                } else {
+                    tc.muted
+                }),
+            ),
+            Span::styled("  │  ", Style::default().fg(tc.muted)),
+            Span::styled("ARM-aware: ", Style::default().fg(tc.muted)),
+            Span::styled(
+                if result.is_arm_aware { "yes" } else { "no" },
+                Style::default().fg(tc.info),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("CPU: ", Style::default().fg(tc.muted)),
+            Span::styled(&app.specs.cpu_name, Style::default().fg(tc.fg)),
+            Span::styled("  │  ", Style::default().fg(tc.muted)),
+            Span::styled("RAM: ", Style::default().fg(tc.muted)),
+            Span::styled(
+                format!(
+                    "{:.1} GB total ({:.1} GB avail)",
+                    app.specs.total_ram_gb, app.specs.available_ram_gb
+                ),
+                Style::default().fg(tc.fg),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Selected: ", Style::default().fg(tc.muted)),
+            Span::styled(
+                result
+                    .selected_candidate
+                    .as_ref()
+                    .map(|c| format!("{} ({})", c.model.name, c.runtime.label()))
+                    .unwrap_or_else(|| "none".to_string()),
+                Style::default().fg(tc.fg).bold(),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Recommendation: ", Style::default().fg(tc.muted)),
+            Span::styled(&result.recommendation, Style::default().fg(tc.accent)),
+        ]),
+    ];
+
+    frame.render_widget(
+        Paragraph::new(header_lines).wrap(Wrap { trim: true }),
+        sections[0],
+    );
+
+    let card_area = sections[1];
+    let card_sections = if card_area.width >= 80 {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(card_area)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(card_area)
+    };
+
+    fn truncate_model_name(name: &str, max_width: usize) -> String {
+        if max_width == 0 {
+            return String::new();
+        }
+        let display_width = name.width();
+        if display_width <= max_width {
+            return name.to_string();
+        }
+        let mut result = String::new();
+        let mut current_width = 0;
+        for c in name.chars() {
+            let w = c.width().unwrap_or(0);
+            if current_width + w + 3 > max_width {
+                result.push_str("...");
+                break;
+            }
+            result.push(c);
+            current_width += w;
+        }
+        result
+    }
+
+    let measured_lines = if let Some(cand) = &result.best_measured {
+        let provenance_lbl = provenance_label(cand.performance_provenance);
+        let match_lbl = match_level_label(cand.benchmark_match_level);
+        let source_lbl = measured_source_label(
+            cand.fit
+                .measured_tps
+                .as_ref()
+                .map(|m| m.source)
+                .unwrap_or(MeasuredSource::Community),
+        );
+
+        let max_name_width = card_sections[0].width.saturating_sub(8) as usize;
+        let model_name = truncate_model_name(&cand.model.name, max_name_width);
+
+        vec![
+            Line::from(Span::styled(
+                "OPTIMIZED FOR THIS MACHINE",
+                Style::default().fg(tc.accent).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                "── BEST MEASURED ──",
+                Style::default().fg(tc.good).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("Model: ", Style::default().fg(tc.muted)),
+                Span::styled(model_name, Style::default().fg(tc.fg).bold()),
+            ]),
+            Line::from(Span::styled(
+                format!("{:.2} tok/s", cand.measured_tps.unwrap_or(0.0)),
+                Style::default().fg(tc.good).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                format!("{} HARDWARE", match_lbl.to_uppercase()),
+                Style::default().fg(tc.info).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                provenance_lbl,
+                Style::default().fg(tc.good).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(vec![
+                Span::styled("Runtime: ", Style::default().fg(tc.muted)),
+                Span::styled(cand.runtime.label(), Style::default().fg(tc.fg)),
+                Span::styled(
+                    format!("  ({})", runtime_avail_label(cand.runtime_availability)),
+                    Style::default().fg(tc.muted),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("Source: ", Style::default().fg(tc.muted)),
+                Span::styled(source_lbl, Style::default().fg(tc.fg)),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Real benchmark from this exact machine.",
+                Style::default().fg(tc.good),
+            )),
+        ]
+    } else {
+        vec![
+            Line::from(Span::styled(
+                "── BEST MEASURED ──",
+                Style::default().fg(tc.good).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "No measured benchmark available for this hardware.",
+                Style::default().fg(tc.muted),
+            )),
+        ]
+    };
+
+    frame.render_widget(
+        Paragraph::new(measured_lines).wrap(Wrap { trim: true }),
+        card_sections[0],
+    );
+
+    let predicted_lines = if let Some(cand) = &result.best_predicted {
+        let provenance_lbl = provenance_label(cand.performance_provenance);
+
+        let max_name_width = card_sections[1].width.saturating_sub(8) as usize;
+        let model_name = truncate_model_name(&cand.model.name, max_name_width);
+
+        vec![
+            Line::from(Span::styled(
+                "── PREDICTED / UNBENCHMARKED ──",
+                Style::default().fg(tc.warning).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("Model: ", Style::default().fg(tc.muted)),
+                Span::styled(model_name, Style::default().fg(tc.fg).bold()),
+            ]),
+            Line::from(Span::styled(
+                format!("{:.1} tok/s ESTIMATE", cand.estimated_tps),
+                Style::default().fg(tc.warning).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                provenance_lbl,
+                Style::default().fg(tc.warning).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                "NO BENCHMARK",
+                Style::default().fg(tc.muted).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(vec![
+                Span::styled("Runtime: ", Style::default().fg(tc.muted)),
+                Span::styled(cand.runtime.label(), Style::default().fg(tc.fg)),
+                Span::styled(
+                    format!("  ({})", runtime_avail_label(cand.runtime_availability)),
+                    Style::default().fg(tc.muted),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("Fit: ", Style::default().fg(tc.muted)),
+                Span::styled(
+                    cand.fit.fit_text(),
+                    Style::default().fg(fit_color(cand.fit.fit_level, tc)),
+                ),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Estimate only — no benchmark evidence.",
+                Style::default().fg(tc.warning),
+            )),
+        ]
+    } else {
+        vec![
+            Line::from(Span::styled(
+                "── PREDICTED / UNBENCHMARKED ──",
+                Style::default().fg(tc.warning).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "No predicted candidate available.",
+                Style::default().fg(tc.muted),
+            )),
+        ]
+    };
+
+    frame.render_widget(
+        Paragraph::new(predicted_lines).wrap(Wrap { trim: true }),
+        card_sections[1],
+    );
+
+    let explanation_lines: Vec<Line> = if let Some(m) = &result.best_measured {
+        vec![
+            Line::from(vec![
+                Span::styled("  ✓ Measured on this exact ", Style::default().fg(tc.fg)),
+                Span::styled(
+                    result.hardware_architecture.label(),
+                    Style::default().fg(tc.fg).bold(),
+                ),
+                Span::styled(
+                    format!(" machine: {:.2} tok/s", m.measured_tps.unwrap_or(0.0)),
+                    Style::default().fg(tc.fg),
+                ),
+            ]),
+            Line::from(Span::styled(
+                "  Predicted values are estimates without benchmark evidence.",
+                Style::default().fg(tc.fg),
+            )),
+        ]
+    } else if let Some(p) = &result.best_predicted {
+        vec![Line::from(Span::styled(
+            format!(
+                "  Predicted: {:.1} tok/s — estimate only, no benchmark evidence.",
+                p.estimated_tps
+            ),
+            Style::default().fg(tc.fg),
+        ))]
+    } else {
+        vec![Line::from(Span::styled(
+            format!("  {}", result.explanation),
+            Style::default().fg(tc.fg),
+        ))]
+    };
+
+    frame.render_widget(Paragraph::new(explanation_lines), sections[2]);
+}
+
 fn draw_detail(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
     let fit = match app.selected_fit() {
         Some(f) => f,
@@ -1917,6 +2260,83 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
             },
         ]),
     ];
+
+    // Performance evidence section (only when measured data exists)
+    if let Some(measured) = &fit.measured_tps {
+        let provenance_label = match measured.source {
+            MeasuredSource::Community => "community",
+            MeasuredSource::CommunityLlmfit => "community (llmfit)",
+            MeasuredSource::LocalBench => "local bench",
+        };
+        let match_label = match measured.match_level {
+            HardwareMatchLevel::Exact => "Exact",
+            HardwareMatchLevel::HighConfidence => "High confidence",
+            HardwareMatchLevel::Partial => "Partial",
+            HardwareMatchLevel::NoMatch => "No match",
+        };
+
+        lines.extend_from_slice(&[
+            Line::from(""),
+            Line::from(Span::styled(
+                "  ── Performance Evidence ──",
+                Style::default().fg(tc.accent),
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  Indicator:   ", Style::default().fg(tc.muted)),
+                Span::styled("MEASURED", Style::default().fg(tc.good).bold()),
+            ]),
+            Line::from(vec![
+                Span::styled("  Measured TPS:", Style::default().fg(tc.muted)),
+                Span::styled(
+                    format!(" {:.2} tok/s", measured.tok_s),
+                    Style::default().fg(tc.good).bold(),
+                ),
+                Span::styled(
+                    format!("  (n={}, via {})", measured.sample_count, provenance_label),
+                    Style::default().fg(tc.muted),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("  Match Level: ", Style::default().fg(tc.muted)),
+                Span::styled(match_label, Style::default().fg(tc.info)),
+            ]),
+        ]);
+
+        lines.extend_from_slice(&[
+            Line::from(vec![
+                Span::styled("  Hardware:    ", Style::default().fg(tc.muted)),
+                Span::styled(&measured.hardware_label, Style::default().fg(tc.fg)),
+            ]),
+            Line::from(vec![
+                Span::styled("  Estimated:   ", Style::default().fg(tc.muted)),
+                Span::styled(
+                    format!(" {:.1} tok/s (formula)", fit.estimated_tps),
+                    Style::default().fg(tc.muted),
+                ),
+            ]),
+        ]);
+    } else {
+        lines.extend_from_slice(&[
+            Line::from(""),
+            Line::from(Span::styled(
+                "  ── Performance ──",
+                Style::default().fg(tc.accent),
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  Indicator:   ", Style::default().fg(tc.muted)),
+                Span::styled("ESTIMATED", Style::default().fg(tc.warning).bold()),
+            ]),
+            Line::from(vec![
+                Span::styled("  Estimated TPS:", Style::default().fg(tc.muted)),
+                Span::styled(
+                    format!(" {:.1} tok/s", fit.estimated_tps),
+                    Style::default().fg(tc.warning),
+                ),
+            ]),
+        ]);
+    }
 
     // Scoring section
     let score_color = if fit.score >= 70.0 {
@@ -3045,6 +3465,9 @@ fn status_keys_and_mode(app: &App) -> (String, String) {
                     "COMPARE".to_string(),
                 );
             }
+            if app.show_optimize {
+                return ("  q/Esc:close  o:close".to_string(), "OPTIMIZE".to_string());
+            }
             let detail_key = if app.show_detail {
                 "Enter:table"
             } else {
@@ -3068,7 +3491,7 @@ fn status_keys_and_mode(app: &App) -> (String, String) {
             };
             (
                 format!(
-                    " S:simulate  A:config  b:benchmarks  I:live-bench  h:help  {}  /:search  f:fit  F:filter  s:sort{}  P:providers  U:use cases  C:caps  R:runtime  q:quit",
+                    " S:simulate  A:config  b:benchmarks  I:live-bench  o:optimize  h:help  {}  /:search  f:fit  F:filter  s:sort{}  P:providers  U:use cases  C:caps  R:runtime  q:quit",
                     detail_key, ollama_keys,
                 ),
                 if app.sim_active {
@@ -3199,6 +3622,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
         && !app.show_plan
         && !app.show_downloads
         && !app.show_benchmarks
+        && !app.show_optimize
     {
         if let Some(&idx) = app.filtered_fits.get(app.selected_row) {
             let fit = &app.all_fits[idx];
@@ -3715,6 +4139,7 @@ fn draw_help_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
         ("  H", "Change GPU (in community leaderboard view)"),
         ("  /", "Search results (in community leaderboard view)"),
         ("  y", "Copy model name"),
+        ("  o", "Optimize — system-wide model recommendation"),
         ("", ""),
         ("Comparison", ""),
         ("  m", "Mark model for compare"),
@@ -5858,5 +6283,253 @@ mod tests {
             visible_dm_dir_input(input, input.len(), (DM_MODELS_DIR_LABEL.len() + 8) as u16),
             ("二三四".to_string(), 6)
         );
+    }
+
+    #[test]
+    fn provenance_label_distinguishes_measured_and_estimated() {
+        assert_eq!(
+            provenance_label(OptimizationProvenance::Measured),
+            "MEASURED"
+        );
+        assert_eq!(
+            provenance_label(OptimizationProvenance::Estimated),
+            "ESTIMATED"
+        );
+        assert_eq!(
+            provenance_label(OptimizationProvenance::Unavailable),
+            "UNAVAILABLE"
+        );
+    }
+
+    #[test]
+    fn match_level_label_covers_all_variants() {
+        assert_eq!(match_level_label(HardwareMatchLevel::Exact), "Exact");
+        assert_eq!(
+            match_level_label(HardwareMatchLevel::HighConfidence),
+            "High confidence"
+        );
+        assert_eq!(match_level_label(HardwareMatchLevel::Partial), "Partial");
+        assert_eq!(match_level_label(HardwareMatchLevel::NoMatch), "No match");
+    }
+
+    #[test]
+    fn runtime_avail_label_covers_all_variants() {
+        assert_eq!(runtime_avail_label(RuntimeAvailability::Unknown), "unknown");
+        assert_eq!(
+            runtime_avail_label(RuntimeAvailability::Unavailable),
+            "unavailable"
+        );
+        assert_eq!(
+            runtime_avail_label(RuntimeAvailability::Installed),
+            "installed"
+        );
+        assert_eq!(
+            runtime_avail_label(RuntimeAvailability::Benchmarkable),
+            "benchmarkable"
+        );
+        assert_eq!(
+            runtime_avail_label(RuntimeAvailability::Benchmarked),
+            "benchmarked"
+        );
+    }
+
+    #[test]
+    fn measured_source_label_covers_all_variants() {
+        assert_eq!(
+            measured_source_label(MeasuredSource::Community),
+            "community"
+        );
+        assert_eq!(
+            measured_source_label(MeasuredSource::CommunityLlmfit),
+            "community (llmfit)"
+        );
+        assert_eq!(
+            measured_source_label(MeasuredSource::LocalBench),
+            "local bench"
+        );
+    }
+
+    #[test]
+    fn draw_optimize_renders_without_panic() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = App::with_specs_and_context(
+            llmfit_core::hardware::SystemSpecs {
+                architecture: llmfit_core::hardware::CpuArchitecture::Aarch64,
+                total_ram_gb: 16.0,
+                available_ram_gb: 14.0,
+                physical_cpu_cores: Some(8),
+                total_cpu_cores: 8,
+                cpu_name: "Cortex-A78".to_string(),
+                cpu_vendor: Some("arm".to_string()),
+                arm_capabilities: None,
+                has_gpu: false,
+                gpu_vram_gb: None,
+                total_gpu_vram_gb: None,
+                gpu_available_gb: None,
+                gpu_name: None,
+                gpu_count: 0,
+                unified_memory: false,
+                backend: llmfit_core::hardware::GpuBackend::CpuArm,
+                gpus: Vec::new(),
+                cluster_mode: false,
+                cluster_node_count: 0,
+            },
+            None,
+        );
+        app.open_optimize();
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                draw_optimize(f, &app, f.area(), &app.theme.colors());
+            })
+            .unwrap();
+
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                draw_optimize(f, &app, f.area(), &app.theme.colors());
+            })
+            .unwrap();
+
+        let backend = TestBackend::new(40, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                draw_optimize(f, &app, f.area(), &app.theme.colors());
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn draw_optimize_renders_predicted_only_without_panic() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = App::with_specs_and_context(
+            llmfit_core::hardware::SystemSpecs {
+                architecture: llmfit_core::hardware::CpuArchitecture::X86_64,
+                total_ram_gb: 32.0,
+                available_ram_gb: 28.0,
+                physical_cpu_cores: Some(16),
+                total_cpu_cores: 16,
+                cpu_name: "Intel Core i9".to_string(),
+                cpu_vendor: Some("intel".to_string()),
+                arm_capabilities: None,
+                has_gpu: false,
+                gpu_vram_gb: None,
+                total_gpu_vram_gb: None,
+                gpu_available_gb: None,
+                gpu_name: None,
+                gpu_count: 0,
+                unified_memory: false,
+                backend: llmfit_core::hardware::GpuBackend::CpuX86,
+                gpus: Vec::new(),
+                cluster_mode: false,
+                cluster_node_count: 0,
+            },
+            None,
+        );
+        app.open_optimize();
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                draw_optimize(f, &app, f.area(), &app.theme.colors());
+            })
+            .unwrap();
+
+        let backend = TestBackend::new(40, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                draw_optimize(f, &app, f.area(), &app.theme.colors());
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn draw_optimize_labels_distinguish_measured_and_predicted() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = App::with_specs_and_context(
+            llmfit_core::hardware::SystemSpecs {
+                architecture: llmfit_core::hardware::CpuArchitecture::Aarch64,
+                total_ram_gb: 16.0,
+                available_ram_gb: 14.0,
+                physical_cpu_cores: Some(8),
+                total_cpu_cores: 8,
+                cpu_name: "Cortex-A78".to_string(),
+                cpu_vendor: Some("arm".to_string()),
+                arm_capabilities: None,
+                has_gpu: false,
+                gpu_vram_gb: None,
+                total_gpu_vram_gb: None,
+                gpu_available_gb: None,
+                gpu_name: None,
+                gpu_count: 0,
+                unified_memory: false,
+                backend: llmfit_core::hardware::GpuBackend::CpuArm,
+                gpus: Vec::new(),
+                cluster_mode: false,
+                cluster_node_count: 0,
+            },
+            None,
+        );
+        app.open_optimize();
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                draw_optimize(f, &app, f.area(), &app.theme.colors());
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area;
+        let mut text = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                if let Some(cell) = buffer.cell((x, y)) {
+                    text.push_str(cell.symbol());
+                }
+            }
+            text.push('\n');
+        }
+
+        let has_measured = app
+            .optimize_result
+            .as_ref()
+            .and_then(|r| r.best_measured.as_ref())
+            .is_some();
+        let has_predicted = app
+            .optimize_result
+            .as_ref()
+            .and_then(|r| r.best_predicted.as_ref())
+            .is_some();
+
+        if has_measured {
+            assert!(text.contains("OPTIMIZED FOR THIS MACHINE"));
+            assert!(text.contains("BEST MEASURED"));
+            assert!(text.contains("Real benchmark from this exact machine."));
+        }
+        if has_predicted {
+            assert!(text.contains("PREDICTED / UNBENCHMARKED"));
+            assert!(text.contains("tok/s ESTIMATE"));
+            if has_measured {
+                assert!(
+                    text.contains("Predicted values are estimates without benchmark evidence.")
+                );
+            } else {
+                assert!(text.contains("estimate only, no benchmark evidence."));
+            }
+        }
     }
 }

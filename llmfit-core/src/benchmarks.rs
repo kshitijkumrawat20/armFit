@@ -79,6 +79,14 @@ pub struct HardwareInfo {
     pub ram_gb: Option<f64>,
     #[serde(default)]
     pub os: Option<String>,
+    #[serde(default)]
+    pub cpu_architecture: Option<String>,
+    #[serde(default)]
+    pub cpu_vendor: Option<String>,
+    #[serde(default)]
+    pub cpu_cores_physical: Option<u32>,
+    #[serde(default)]
+    pub arm_capabilities: Option<crate::hardware::ArmCapabilities>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -427,6 +435,8 @@ pub struct MeasuredTps {
     pub hardware_label: String,
     #[serde(default)]
     pub source: MeasuredSource,
+    #[serde(default)]
+    pub match_level: HardwareMatchLevel,
 }
 
 /// Find the embedded-cache hardware preset matching the detected GPU.
@@ -515,6 +525,7 @@ impl MeasuredTpsIndex {
             sample_count: n as u32,
             hardware_label: self.hardware_label.to_string(),
             source: MeasuredSource::Community,
+            match_level: HardwareMatchLevel::Exact, // preset matching is generic anyway
         })
     }
 }
@@ -543,16 +554,66 @@ pub fn community_submissions() -> &'static [serde_json::Value] {
 /// Whether a submission's recorded `hardware` object matches `specs` (same
 /// CPU and GPU name). Shared by the local store and the embedded community
 /// data: measurements only transfer between identical configurations.
-pub fn hardware_payload_matches(hw: &serde_json::Value, specs: &SystemSpecs) -> bool {
-    let cpu_ok = hw["cpu"]
-        .as_str()
-        .is_some_and(|c| c.eq_ignore_ascii_case(&specs.cpu_name));
-    let gpu_ok = match (&specs.gpu_name, hw["hardwareName"].as_str()) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HardwareMatchLevel {
+    Exact,
+    #[default]
+    HighConfidence,
+    Partial,
+    NoMatch,
+}
+
+pub fn evaluate_hardware_match(hw: &serde_json::Value, specs: &SystemSpecs) -> HardwareMatchLevel {
+    let hw_cpu = hw["cpu"].as_str();
+    let hw_gpu = hw["hardwareName"].as_str();
+    let cpu_exact = hw_cpu.is_some_and(|c| c.eq_ignore_ascii_case(&specs.cpu_name));
+    let gpu_exact = match (&specs.gpu_name, hw_gpu) {
         (Some(now), Some(then)) => now.eq_ignore_ascii_case(then),
         (None, None) => true,
         _ => false,
     };
-    cpu_ok && gpu_ok
+
+    let hw_arch = hw["cpuArchitecture"]
+        .as_str()
+        .map(crate::hardware::CpuArchitecture::from_arch_str);
+
+    // Legacy payloads may omit `cpuArchitecture`. Preserve the historical
+    // exact-match behavior for those submissions when both the CPU and GPU
+    // identifiers still match exactly; otherwise reject them.
+    if hw_arch.is_none() {
+        return if cpu_exact && gpu_exact {
+            HardwareMatchLevel::Exact
+        } else {
+            HardwareMatchLevel::NoMatch
+        };
+    }
+
+    if hw_arch != Some(specs.architecture) {
+        return HardwareMatchLevel::NoMatch;
+    }
+
+    if cpu_exact && gpu_exact {
+        return HardwareMatchLevel::Exact;
+    }
+
+    if gpu_exact
+        && matches!(
+            specs.architecture,
+            crate::hardware::CpuArchitecture::Aarch64 | crate::hardware::CpuArchitecture::X86_64
+        )
+    {
+        // Historical x86_64 submissions and ARM64 hardware with stable
+        // architecture metadata can still be valid when the GPU bucket aligns,
+        // even if an OEM reports a slightly different CPU string.
+        return HardwareMatchLevel::HighConfidence;
+    }
+
+    HardwareMatchLevel::NoMatch
+}
+
+pub fn hardware_payload_matches(hw: &serde_json::Value, specs: &SystemSpecs) -> bool {
+    evaluate_hardware_match(hw, specs) != HardwareMatchLevel::NoMatch
 }
 
 /// One benchmark result from a community submission, for leaderboard display.
@@ -562,6 +623,7 @@ pub struct CommunityResult {
     pub provider: String,
     pub avg_tps: f64,
     pub ttft_ms: Option<f64>,
+    pub match_level: HardwareMatchLevel,
 }
 
 /// Community results recorded on hardware matching `specs`, newest
@@ -575,19 +637,35 @@ pub fn community_results_for_specs(specs: &SystemSpecs) -> Vec<CommunityResult> 
 
     let mut out = Vec::new();
     for s in subs {
-        for r in s["results"]
-            .as_array()
-            .map(|v| v.as_slice())
-            .unwrap_or_default()
-        {
-            let Some(tps) = r["avgTps"].as_f64().filter(|t| *t > 0.0) else {
+        let results: Vec<&serde_json::Value> = if let Some(results) = s["results"].as_array() {
+            results.iter().collect()
+        } else if s["model"].is_string() || s["provider"].is_string() || s["avgTps"].is_f64() {
+            vec![s]
+        } else {
+            Vec::new()
+        };
+        for r in results {
+            let model = r["model"]
+                .as_str()
+                .or_else(|| r["result"]["model"].as_str());
+            let provider = r["provider"]
+                .as_str()
+                .or_else(|| r["result"]["provider"].as_str());
+            let Some(tps) = r["avgTps"]
+                .as_f64()
+                .or_else(|| r["result"]["avgTps"].as_f64())
+                .filter(|t| *t > 0.0)
+            else {
                 continue;
             };
             out.push(CommunityResult {
-                model: r["model"].as_str().unwrap_or("?").to_string(),
-                provider: r["provider"].as_str().unwrap_or("").to_string(),
+                model: model.unwrap_or("?").to_string(),
+                provider: provider.unwrap_or("").to_string(),
                 avg_tps: tps,
-                ttft_ms: r["avgTtftMs"].as_f64(),
+                ttft_ms: r["avgTtftMs"]
+                    .as_f64()
+                    .or_else(|| r["result"]["avgTtftMs"].as_f64()),
+                match_level: evaluate_hardware_match(&s["hardware"], specs),
             });
         }
     }
@@ -600,15 +678,15 @@ pub fn community_results_for_specs(specs: &SystemSpecs) -> Vec<CommunityResult> 
 /// a fresh install measured numbers (and calibration anchors) from day one
 /// when someone already contributed on the same hardware.
 pub struct CommunityBenchIndex {
-    /// (provider model tag, tok/s), newest submission first.
-    entries: Vec<(String, f64)>,
+    /// (provider model tag, tok/s, match_level), newest submission first.
+    entries: Vec<(String, f64, HardwareMatchLevel)>,
 }
 
 impl CommunityBenchIndex {
     pub fn for_specs(specs: &SystemSpecs) -> Option<Self> {
-        let entries: Vec<(String, f64)> = community_results_for_specs(specs)
+        let entries: Vec<(String, f64, HardwareMatchLevel)> = community_results_for_specs(specs)
             .into_iter()
-            .map(|r| (r.model, r.avg_tps))
+            .map(|r| (r.model, r.avg_tps, r.match_level))
             .collect();
         (!entries.is_empty()).then_some(Self { entries })
     }
@@ -616,27 +694,36 @@ impl CommunityBenchIndex {
     /// Median community-measured tok/s for a catalog model, resolved through
     /// the same tag-matching heuristics as installed detection.
     pub fn lookup(&self, model_hf_name: &str) -> Option<MeasuredTps> {
-        let mut matches: Vec<f64> = self
+        let mut matches: Vec<(f64, HardwareMatchLevel)> = self
             .entries
             .iter()
-            .filter(|(tag, _)| crate::providers::tag_matches_model(tag, model_hf_name))
-            .map(|(_, tps)| *tps)
+            .filter(|(tag, _, _)| crate::providers::tag_matches_model(tag, model_hf_name))
+            .map(|(_, tps, ml)| (*tps, *ml))
             .collect();
         if matches.is_empty() {
             return None;
         }
-        matches.sort_by(|a, b| a.partial_cmp(b).expect("tok/s values are finite"));
+        matches.sort_by(|a, b| a.0.partial_cmp(&b.0).expect("tok/s values are finite"));
         let n = matches.len();
         let median = if n % 2 == 1 {
-            matches[n / 2]
+            matches[n / 2].0
         } else {
-            (matches[n / 2 - 1] + matches[n / 2]) / 2.0
+            (matches[n / 2 - 1].0 + matches[n / 2].0) / 2.0
+        };
+        // Use the worst match level of the medians for provenance safety
+        let match_level = if matches[n / 2].1 == HardwareMatchLevel::Partial
+            || (n % 2 == 0 && matches[n / 2 - 1].1 == HardwareMatchLevel::Partial)
+        {
+            HardwareMatchLevel::Partial
+        } else {
+            HardwareMatchLevel::Exact
         };
         Some(MeasuredTps {
             tok_s: median,
             sample_count: n as u32,
             hardware_label: "identical hardware".to_string(),
             source: MeasuredSource::CommunityLlmfit,
+            match_level,
         })
     }
 }
@@ -963,10 +1050,14 @@ mod tests {
 
     fn specs(cpu: &str, gpu: Option<&str>) -> SystemSpecs {
         SystemSpecs {
+            architecture: crate::hardware::CpuArchitecture::X86_64,
             total_ram_gb: 32.0,
             available_ram_gb: 24.0,
+            physical_cpu_cores: Some(8),
             total_cpu_cores: 8,
             cpu_name: cpu.to_string(),
+            cpu_vendor: None,
+            arm_capabilities: None,
             has_gpu: gpu.is_some(),
             gpu_vram_gb: None,
             total_gpu_vram_gb: None,
@@ -1037,6 +1128,38 @@ mod tests {
             &cpu_only,
             &specs("Test CPU", Some("Test GPU"))
         ));
+    }
+
+    #[test]
+    fn hardware_payload_matching_accepts_arm64_arch_aliases() {
+        use serde_json::json;
+        let mut specs = specs("Neoverse-N1", None);
+        specs.architecture = crate::hardware::CpuArchitecture::Aarch64;
+        let hw = json!({
+            "cpu": "Neoverse-N1",
+            "hardwareName": null,
+            "cpuArchitecture": "arm64"
+        });
+        assert_eq!(
+            evaluate_hardware_match(&hw, &specs),
+            HardwareMatchLevel::Exact
+        );
+    }
+
+    #[test]
+    fn arm64_benchmark_matches_on_architecture_when_cpu_name_varies() {
+        use serde_json::json;
+        let mut specs = specs("Neoverse-N1", None);
+        specs.architecture = crate::hardware::CpuArchitecture::Aarch64;
+        let hw = json!({
+            "cpu": "Amazon Graviton3",
+            "hardwareName": null,
+            "cpuArchitecture": "arm64"
+        });
+        assert_eq!(
+            evaluate_hardware_match(&hw, &specs),
+            HardwareMatchLevel::HighConfidence
+        );
     }
 
     #[test]
